@@ -1,7 +1,7 @@
 name: shift_calendar
 description: 광고 없는 교대근무 캘린더 + 알람
 publish_to: "none"
-version: 1.1.0+2
+version: 2.0.0+3
 
 environment:
   sdk: ">=3.3.0 <4.0.0"

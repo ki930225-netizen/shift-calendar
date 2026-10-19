@@ -154,7 +154,7 @@ List<Ev> _handle(Map<String, String> p, List<String> ex, bool allDay, DateTime f
   if (allDay && end != null) {
     final s0 = DateTime(start.year, start.month, start.day);
     final e0 = DateTime(end.year, end.month, end.day);
-    span = e0.difference(s0).inDays.clamp(1, 31);
+    span = e0.difference(s0).inDays.clamp(1, 31).toInt();
   }
 
   final exSet = <String>{};
