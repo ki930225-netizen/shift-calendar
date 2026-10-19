@@ -309,6 +309,14 @@ class Store extends ChangeNotifier {
 
   /// 앞으로 60일치 알람을 전부 다시 등록한다. (앱을 열 때마다 자동으로 갱신됨)
   Future<void> rescheduleAll() async {
+    try {
+      await _rescheduleImpl();
+    } catch (e) {
+      debugPrint('알람 등록 실패: $e');
+    }
+  }
+
+  Future<void> _rescheduleImpl() async {
     if (kIsWeb) return; // PC 크롬 미리보기에서는 알람 기능 없음
     await notif.cancelAll();
     final now = tz.TZDateTime.now(tz.local);
@@ -334,7 +342,7 @@ class Store extends ChangeNotifier {
       final memo = memos[dayKey(d)];
       if (memo != null && memo.isNotEmpty) body += ' · ${memo.first}';
 
-      await notif.zonedSchedule(
+      Future<void> schedule(AndroidScheduleMode mode) => notif.zonedSchedule(
         int.parse(DateFormat('yyyyMMdd').format(d)),
         title,
         body,
@@ -353,8 +361,16 @@ class Store extends ChangeNotifier {
             enableVibration: true,
           ),
         ),
-        androidScheduleMode: AndroidScheduleMode.exactAllowWhileIdle,
+        androidScheduleMode: mode,
       );
+      try {
+        await schedule(AndroidScheduleMode.exactAllowWhileIdle);
+      } catch (_) {
+        // 정확한 알람 권한이 없으면 덜 정확한 방식으로라도 등록
+        try {
+          await schedule(AndroidScheduleMode.inexactAllowWhileIdle);
+        } catch (_) {}
+      }
     }
   }
 }
@@ -380,11 +396,26 @@ Future<void> initNotifications() async {
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
-  await initializeDateFormatting('ko_KR');
-  await initNotifications();
-  await store.load();
+  try {
+    await initializeDateFormatting('ko_KR');
+  } catch (_) {}
+  try {
+    await store.load();
+  } catch (e) {
+    debugPrint('데이터 불러오기 실패: $e');
+  }
+  runApp(const ShiftApp()); // 화면을 먼저 띄운다 (알람/동기화 오류가 있어도 앱은 열림)
+  _startup();
+}
+
+/// 화면이 뜬 뒤에 알람 초기화 → 알람 등록 → 공휴일/일정 동기화를 순서대로, 각각 안전하게 실행
+Future<void> _startup() async {
+  try {
+    await initNotifications().timeout(const Duration(seconds: 30));
+  } catch (e) {
+    debugPrint('알림 초기화 실패: $e');
+  }
   await store.rescheduleAll();
-  runApp(const ShiftApp());
   store.syncAll(); // 앱을 열 때마다 공휴일/내 일정을 자동으로 갱신
 }
 
