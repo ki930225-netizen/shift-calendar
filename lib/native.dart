@@ -110,3 +110,61 @@ Future<String?> filesDirPath() async {
     return null;
   }
 }
+
+// ───────────── 근무 알람 (알람 시계 방식, 앱이 직접 울림) ─────────────
+
+/// 근무 알람 목록을 통째로 등록. 실패하면 예외를 던진다(호출하는 쪽에서 예비 방식으로 전환).
+/// 각 항목: id, at(밀리초), title, body, tone, sound, vibrate, key, noticeAt, noticeTitle, noticeBody
+Future<Map<String, dynamic>> nativeSetAlarms(List<Map<String, dynamic>> alarms) async {
+  if (kIsWeb) throw UnsupportedError('web');
+  final r = await _ch.invokeMethod<dynamic>('alarmSetAll', {'alarms': alarms});
+  if (r is Map) return Map<String, dynamic>.from(r);
+  return <String, dynamic>{};
+}
+
+/// 테스트 알람 등 하나만 예약. 반환: clock / inexact / fail (+ 오류)
+Future<String> nativeScheduleOne(Map<String, dynamic> alarm) async {
+  if (kIsWeb) throw UnsupportedError('web');
+  return (await _ch.invokeMethod<String>('alarmScheduleOne', alarm)) ?? 'fail';
+}
+
+/// 바로 알람 화면 띄우고 울리기 (테스트)
+Future<void> nativeRingNow(Map<String, dynamic> alarm) async {
+  if (kIsWeb) throw UnsupportedError('web');
+  await _ch.invokeMethod<dynamic>('alarmRingNow', alarm);
+}
+
+/// 알림창의 "이번 알람 끄기"로 꺼진 회차 (가져오면 비워짐)
+Future<List<String>> nativeTakeSkipped() async {
+  if (kIsWeb) return <String>[];
+  try {
+    final r = await _ch.invokeMethod<List<dynamic>>('alarmTakeSkipped');
+    return (r ?? const []).map((e) => e.toString()).toList();
+  } catch (_) {
+    return <String>[];
+  }
+}
+
+/// 앱이 직접 예약해 둔 알람 수. 알 수 없으면 -1
+Future<int> nativeAlarmCount() async {
+  if (kIsWeb) return -1;
+  try {
+    final r = await _ch.invokeMethod<dynamic>('alarmInfo');
+    if (r is Map) return (r['count'] as num?)?.toInt() ?? -1;
+    return -1;
+  } catch (_) {
+    return -1;
+  }
+}
+
+/// 잠금 화면 위에 알람 화면을 띄울 수 있는지 (안드로이드 14+ "전체 화면 알림" 권한)
+Future<bool> canFullScreen() async {
+  if (kIsWeb) return true;
+  try {
+    return (await _ch.invokeMethod<bool>('canFullScreen')) ?? true;
+  } catch (_) {
+    return true;
+  }
+}
+
+Future<void> openFullScreenSettings() => _call('openFullScreenSettings');

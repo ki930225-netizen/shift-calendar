@@ -169,7 +169,10 @@ class AlarmStatus {
   final bool exactOk;
   final int pending;
   final bool batteryOk;
-  AlarmStatus(this.notifOk, this.exactOk, this.pending, this.batteryOk);
+  final bool fullOk; // 잠금 화면 위 알람 화면(전체 화면 알림) 허용
+  final int nativePending; // 앱이 직접 예약한 근무 알람 수 (-1: 모름)
+  AlarmStatus(this.notifOk, this.exactOk, this.pending, this.batteryOk,
+      {this.fullOk = true, this.nativePending = -1});
 }
 
 /// 같은 입력이면 항상 같은 번호가 나오는 해시 (알림 번호용)
@@ -944,7 +947,9 @@ class Store extends ChangeNotifier {
           reschedError = '';
         } catch (e) {
           debugPrint('알람 등록 실패: $e');
-          reschedError = '${DateFormat('HH:mm:ss').format(DateTime.now())} ${_short(e)}';
+          final es = e.toString();
+          reschedError = '${DateFormat('HH:mm:ss').format(DateTime.now())} '
+              '${es.length > 400 ? es.substring(0, 400) : es}';
           schedVersion++;
           notifyListeners();
         }
@@ -983,17 +988,33 @@ class Store extends ChangeNotifier {
     await rescheduleAll();
   }
 
+  /// 마지막 등록 때 생긴 문제들 (화면에 그대로 보여 준다)
+  String schedWarn = '';
+
   Future<void> _rescheduleImpl() async {
     if (kIsWeb) return; // PC 크롬 미리보기에서는 알람 기능 없음
-    final prefs = await SharedPreferences.getInstance();
-    // 예전 방식(번호 1,2,3...)으로 등록된 알림은 한 번만 전부 지운다
-    if (!(prefs.getBool('sched_v3') ?? false)) {
-      await notif.cancelAll();
-      await prefs.setBool('sched_v3', true);
+    final errs = <String>[];
+    SharedPreferences? prefs;
+    try {
+      prefs = await SharedPreferences.getInstance();
+    } catch (e) {
+      errs.add('설정 읽기: $e');
     }
-    await prefs.reload(); // "이번 알람 끄기"가 다른 곳(백그라운드)에서 저장한 값을 읽기 위해
+    // 예전 방식(번호 1,2,3...)으로 등록된 알림은 한 번만 전부 지운다
+    if (prefs != null && !(prefs.getBool('sched_v3') ?? false)) {
+      try {
+        await notif.cancelAll();
+      } catch (e) {
+        errs.add('예전 알림 정리: $e');
+      }
+      try {
+        await prefs.setBool('sched_v3', true);
+      } catch (_) {}
+    }
+    try {
+      await prefs?.reload(); // "이번 알람 끄기"가 다른 곳(백그라운드)에서 저장한 값을 읽기 위해
+    } catch (_) {}
     final now = DateTime.now();
-    final pend = <_Pending>[];
     final used = <int>{};
     int idFor(String key) {
       var id = _fnv(key);
@@ -1005,15 +1026,28 @@ class Store extends ChangeNotifier {
     }
 
     // "이번 알람 끄기"로 건너뛰기로 한 회차 (지난 것은 정리)
-    final skipped = <String>{...(prefs.getStringList('skipped') ?? <String>[])};
+    final skipped = <String>{};
+    try {
+      skipped.addAll(prefs?.getStringList('skipped') ?? const <String>[]);
+    } catch (e) {
+      errs.add('건너뛰기 목록: $e');
+    }
+    skipped.addAll(await nativeTakeSkipped());
     skipped.removeWhere((k) {
       final parts = k.split('|');
       final ms = parts.length >= 3 ? int.tryParse(parts[2]) : null;
       return ms == null || ms < now.millisecondsSinceEpoch - 86400000;
     });
-    await prefs.setStringList('skipped', skipped.toList());
+    try {
+      await prefs?.setStringList('skipped', skipped.toList());
+    } catch (e) {
+      errs.add('건너뛰기 저장: $e');
+    }
 
     // 1) 근무별 알람: 앞으로 60일 (+ 알람 전 미리 알림)
+    final alarmPend = <_Pending>[];
+    final noticePend = <_Pending>[];
+    final nativeList = <Map<String, dynamic>>[];
     for (final na in planShiftAlarms(now, 60)) {
       final a = na.alarm;
       final shift = shiftById(a.shiftId);
@@ -1024,21 +1058,25 @@ class Store extends ChangeNotifier {
       final body = a.label.isNotEmpty ? a.label : '$day ${shift.label} 근무 · ${fmtHM(a.minutes)}';
       final aid = idFor(key);
       final atitle = '${shift.label} 근무 알람';
-      pend.add(_Pending(na.when, atitle, body, true,
+      alarmPend.add(_Pending(na.when, atitle, body, true,
           tone: a.tone,
           sound: a.sound,
           vibrate: a.vibrate,
           key: key,
           id: aid,
           payload: alarmPayload(aid, a.tone, a.sound, a.vibrate, atitle, body)));
+      int noticeAt = 0;
+      final nTitle = '$preNoticeMin분 뒤 알람 · ${shift.label} 근무';
+      final nBody = '${fmtHM(a.minutes)}에 알람이 울려요. 이번만 끄려면 아래 버튼을 누르세요';
       if (preNoticeMin > 0) {
         final nw = na.when.subtract(Duration(minutes: preNoticeMin));
         if (nw.isAfter(now)) {
+          noticeAt = nw.millisecondsSinceEpoch;
           final nkey = 'P|$key';
-          pend.add(_Pending(
+          noticePend.add(_Pending(
             nw,
-            '$preNoticeMin분 뒤 알람 · ${shift.label} 근무',
-            '${fmtHM(a.minutes)}에 알람이 울려요. 이번만 끄려면 아래 버튼을 누르세요',
+            nTitle,
+            nBody,
             false,
             key: nkey,
             id: idFor(nkey),
@@ -1048,10 +1086,46 @@ class Store extends ChangeNotifier {
           ));
         }
       }
+      nativeList.add({
+        'id': aid,
+        'at': na.when.millisecondsSinceEpoch,
+        'title': atitle,
+        'body': body,
+        'tone': a.tone,
+        'sound': a.sound,
+        'vibrate': a.vibrate,
+        'key': key,
+        'noticeAt': noticeAt,
+        'noticeTitle': nTitle,
+        'noticeBody': nBody,
+      });
     }
 
-    // 2) 메모 알림: 앞으로 120일
+    // 근무 알람은 앱이 직접 울리는 "알람 시계" 방식으로 등록 (진동/무음 모드에서도 소리, 잠금 화면에 알람 화면)
+    // 안드로이드 예약 한도(앱당 약 500개)를 넘지 않도록 가까운 150회까지
+    nativeList.sort((x, y) => (x['at'] as int).compareTo(y['at'] as int));
+    bool nativeOk = false;
+    String nativeNote = '';
+    try {
+      final r = await nativeSetAlarms(nativeList.take(150).toList())
+          .timeout(const Duration(seconds: 20));
+      nativeOk = true;
+      nativeNote = '근무 알람 ${r['total'] ?? '?'}개 (알람시계 ${r['clock'] ?? 0} · 부정확 ${r['inexact'] ?? 0} · '
+          '실패 ${r['fail'] ?? 0})';
+      final le = r['error'];
+      if (le is String && le.isNotEmpty) errs.add('알람 예약 경고: $le');
+    } catch (e) {
+      errs.add('알람 화면 방식 실패 → 일반 알림으로 대신 등록: $e');
+    }
+
+    // 2) 메모 알림 (+ 위가 실패했을 때만 근무 알람도 일반 알림으로)
+    final pend = <_Pending>[];
+    if (!nativeOk) {
+      pend.addAll(alarmPend);
+      pend.addAll(noticePend);
+    }
     final limit = now.add(const Duration(days: 120));
+    int nMemo = 0;
     for (final m in memos) {
       if (m.alarmBefore < 0 || m.done) continue;
       final sd = parseKey(m.start);
@@ -1062,15 +1136,15 @@ class Store extends ChangeNotifier {
       final key = 'M|${m.id}|${when.millisecondsSinceEpoch}';
       pend.add(_Pending(when, '메모 알림', m.title.isEmpty ? '(제목 없음)' : m.title, false,
           key: key, id: idFor(key)));
+      nMemo++;
     }
 
-    // 안드로이드 예약 한도(약 500개)를 넘지 않도록 가까운 순서로 450개까지
     pend.sort((a, b) => a.when.compareTo(b.when));
-    final take = pend.take(450).toList();
+    final take = pend.take(nativeOk ? 150 : 450).toList();
     final keep = <int>{for (final p in take) p.id};
 
-    // 같은 알람은 항상 같은 번호로 등록 → 다시 등록해도 덮어쓸 뿐이라 중간에 앱이 멈춰도 알람이 사라지지 않는다
     int nClock = 0, nExact = 0, nInexact = 0, nFail = 0, nAlarm = 0;
+    lastSchedError = '';
     for (final p in take) {
       final r = await _scheduleOne(p.id, p);
       if (r == 'clock') nClock++;
@@ -1087,11 +1161,19 @@ class Store extends ChangeNotifier {
         if (r.id == 9001 || r.id == 9002 || r.id >= 0x40000000) continue;
         if (!keep.contains(r.id)) await notif.cancel(r.id);
       }
-    } catch (_) {}
+    } catch (e) {
+      errs.add('예약 목록 확인: $e');
+    }
 
-    schedNote = '근무 알람 $nAlarm개 포함 총 ${take.length}개 등록 '
-        '(알람시계 $nClock · 정확 $nExact · 부정확 $nInexact · 실패 $nFail) '
-        '${DateFormat('HH:mm:ss').format(DateTime.now())}';
+    final t = DateFormat('HH:mm:ss').format(DateTime.now());
+    if (nativeOk) {
+      schedNote = '$nativeNote · 메모 알림 $nMemo개'
+          '${nFail > 0 ? ' (메모 실패 $nFail)' : ''} · $t';
+    } else {
+      schedNote = '[일반 알림 방식] 근무 알람 $nAlarm개 포함 총 ${take.length}개 등록 '
+          '(알람시계 $nClock · 정확 $nExact · 부정확 $nInexact · 실패 $nFail) $t';
+    }
+    schedWarn = errs.join('\n');
     schedVersion++;
     notifyListeners();
   }
@@ -1176,6 +1258,36 @@ class Store extends ChangeNotifier {
     bool vibrate = true,
   }) async {
     if (kIsWeb) return 'PC 미리보기에서는 알람을 테스트할 수 없어요';
+    final String whenTxt = seconds >= 60 ? '${seconds ~/ 60}분' : '$seconds초';
+    final m = <String, dynamic>{
+      'id': 9002,
+      'at': DateTime.now().add(Duration(seconds: now ? 0 : seconds)).millisecondsSinceEpoch,
+      'title': '테스트 알람',
+      'body': '이 알람이 들리면 정상입니다',
+      'tone': tone,
+      'sound': sound,
+      'vibrate': vibrate,
+      'key': 'T|9002|0',
+      'noticeAt': 0,
+    };
+    String nativeErr = '';
+    try {
+      if (now) {
+        await nativeRingNow(m);
+        return '알람 화면을 띄웠어요. 소리가 작으면 알람 볼륨을 올려 주세요';
+      }
+      final r = await nativeScheduleOne(m);
+      schedVersion++;
+      notifyListeners();
+      if (r.startsWith('clock')) {
+        return '$whenTxt 뒤에 알람 화면이 떠요. 앱을 완전히 끄고 화면도 끈 채로 기다려 보세요';
+      }
+      if (r.startsWith('inexact')) return '예약은 됐지만 "정확한 알람" 권한이 없어 늦을 수 있어요 ($r)';
+      nativeErr = r;
+    } catch (e) {
+      nativeErr = e.toString();
+    }
+    // 알람 화면 방식이 안 되면 예전(일반 알림) 방식으로
     try {
       final p = _Pending(
         DateTime.now().add(Duration(seconds: seconds)),
@@ -1189,15 +1301,15 @@ class Store extends ChangeNotifier {
       );
       if (now) {
         await notif.show(9001, p.title, p.body, _detailsFor(p), payload: p.payload);
-        return '알림을 보냈어요. 소리가 안 나면 아래 점검 항목을 확인하세요';
+        return '[예비 방식] 알림을 보냈어요 ($nativeErr)';
       }
       final r = await _scheduleOne(9002, p);
       final String when = seconds >= 60 ? '${seconds ~/ 60}분' : '$seconds초';
       if (r == 'clock' || r == 'exact') {
-        return '$when 뒤에 울려요. 앱을 완전히 종료하고 화면을 끈 채로 기다려 보세요';
+        return '[예비 방식] $when 뒤에 울려요 ($nativeErr)';
       }
       if (r == 'inexact') return '예약은 됐지만 "정확한 알람" 권한이 없어 시간이 늦을 수 있어요';
-      return '알람 예약에 실패했어요: $lastSchedError';
+      return '알람 예약에 실패했어요: $lastSchedError / $nativeErr';
     } catch (e) {
       return '테스트 실패: $e';
     }
@@ -1221,9 +1333,14 @@ class Store extends ChangeNotifier {
           notif.resolvePlatformSpecificImplementation<AndroidFlutterLocalNotificationsPlugin>();
       final n = await a?.areNotificationsEnabled() ?? false;
       final e = await a?.canScheduleExactNotifications() ?? false;
-      final p = (await notif.pendingNotificationRequests()).length;
+      int p = -1;
+      try {
+        p = (await notif.pendingNotificationRequests()).length;
+      } catch (_) {}
       final bt = await isIgnoringBattery();
-      return AlarmStatus(n, e, p, bt);
+      final fs = await canFullScreen();
+      final np = await nativeAlarmCount();
+      return AlarmStatus(n, e, p, bt, fullOk: fs, nativePending: np);
     } catch (_) {
       return AlarmStatus(false, false, 0, false);
     }

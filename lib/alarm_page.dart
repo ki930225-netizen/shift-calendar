@@ -215,23 +215,33 @@ class _AlarmPageState extends State<AlarmPage> {
                 _statusRow('배터리 제한 없음 (절전으로 알람이 꺼지는 것 방지)', s.batteryOk,
                     fixText: '허용하기',
                     onFix: () => requestIgnoreBattery().then((_) => _refreshStatus())),
+                _statusRow('잠금 화면에 알람 화면 띄우기 (전체 화면 알림)', s.fullOk,
+                    fixText: '허용하기',
+                    onFix: () => openFullScreenSettings().then((_) => _refreshStatus())),
                 Padding(
                   padding: const EdgeInsets.symmetric(vertical: 2),
                   child: Row(children: [
                     const Icon(Icons.schedule, size: 18, color: Colors.blueGrey),
                     const SizedBox(width: 8),
-                    Text('예약된 알림 ${s.pending}개'),
+                    Expanded(
+                      child: Text(s.nativePending >= 0
+                          ? '예약된 근무 알람 ${s.nativePending}개 · 기타 알림 ${s.pending < 0 ? '?' : s.pending}개'
+                          : '예약된 알림 ${s.pending < 0 ? '?' : s.pending}개'),
+                    ),
                   ]),
                 ),
                 if (store.schedNote.isNotEmpty)
                   Text('마지막 등록: ${store.schedNote}',
                       style: const TextStyle(fontSize: 11, color: Colors.grey)),
                 if (store.lastSchedError.isNotEmpty)
-                  Text('등록 오류: ${store.lastSchedError}',
+                  SelectableText('등록 오류: ${store.lastSchedError}',
                       style: const TextStyle(fontSize: 11, color: Colors.red)),
                 if (store.reschedError.isNotEmpty)
-                  Text('자동 등록 실패: ${store.reschedError}',
+                  SelectableText('자동 등록 실패: ${store.reschedError}',
                       style: const TextStyle(fontSize: 11, color: Colors.red)),
+                if (store.schedWarn.isNotEmpty)
+                  SelectableText('참고: ${store.schedWarn}',
+                      style: const TextStyle(fontSize: 11, color: Colors.deepOrange)),
                 Text(store.planSummary(),
                     style: const TextStyle(fontSize: 11, color: Colors.blueGrey)),
                 Align(
