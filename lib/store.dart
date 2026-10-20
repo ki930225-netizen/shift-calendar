@@ -919,25 +919,61 @@ class Store extends ChangeNotifier {
 
   /// 근무별 알람 + 메모 알림을 다시 등록한다. 앱을 열 때와 설정을 바꿀 때마다 자동 실행.
   /// (동시에 두 번 돌지 않도록 한 번에 하나씩만 처리한다)
+  DateTime? _reschedStart;
+  String reschedError = '';
+
   Future<void> rescheduleAll() async {
+    // 이전 등록이 1분 넘게 끝나지 않으면 멈춘 것으로 보고 새로 시작한다
+    if (_rescheduling &&
+        _reschedStart != null &&
+        DateTime.now().difference(_reschedStart!) > const Duration(seconds: 60)) {
+      _rescheduling = false;
+    }
     if (_rescheduling) {
       _reschedAgain = true;
       return;
     }
     _rescheduling = true;
+    _reschedStart = DateTime.now();
     try {
       do {
         _reschedAgain = false;
         try {
-          await _rescheduleImpl();
+          await _rescheduleImpl().timeout(const Duration(seconds: 45));
           _lastResched = DateTime.now();
+          reschedError = '';
         } catch (e) {
           debugPrint('알람 등록 실패: $e');
+          reschedError = '${DateFormat('HH:mm:ss').format(DateTime.now())} ${_short(e)}';
+          schedVersion++;
+          notifyListeners();
         }
       } while (_reschedAgain);
     } finally {
       _rescheduling = false;
     }
+  }
+
+  /// 근무 알람 계산 결과 요약 (알람 탭에 표시: 왜 0개인지 바로 보이게)
+  String planSummary() {
+    final enabled = alarms.where((a) => a.enabled).toList();
+    final plan = planShiftAlarms(DateTime.now(), 60);
+    final shiftDays = days.length;
+    final sb = StringBuffer('알람 ${alarms.length}개(켜짐 ${enabled.length}) · 근무 입력된 날 $shiftDays일 · '
+        '60일 안에 울릴 근무 알람 ${plan.length}회');
+    if (plan.isEmpty && enabled.isNotEmpty) {
+      final now = DateTime.now();
+      final upcoming = <String>{};
+      for (int i = 0; i <= 60; i++) {
+        final sid = days[dayKey(DateTime(now.year, now.month, now.day + i))];
+        if (sid != null) upcoming.add(sid);
+      }
+      sb.write(upcoming.isEmpty
+          ? '\n→ 오늘부터 60일 안에 입력된 근무가 없어요. 달력에서 근무를 먼저 입력하세요'
+          : '\n→ 앞으로 입력된 근무(${upcoming.map((e) => shiftById(e)?.label ?? e).join(",")})와 '
+              '알람의 근무(${enabled.map((a) => shiftById(a.shiftId)?.label ?? a.shiftId).toSet().join(",")})가 달라요');
+    }
+    return sb.toString();
   }
 
   /// 앱으로 돌아올 때: 10분 안에 이미 등록했다면 건너뛴다

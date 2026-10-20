@@ -229,6 +229,28 @@ class _AlarmPageState extends State<AlarmPage> {
                 if (store.lastSchedError.isNotEmpty)
                   Text('등록 오류: ${store.lastSchedError}',
                       style: const TextStyle(fontSize: 11, color: Colors.red)),
+                if (store.reschedError.isNotEmpty)
+                  Text('자동 등록 실패: ${store.reschedError}',
+                      style: const TextStyle(fontSize: 11, color: Colors.red)),
+                Text(store.planSummary(),
+                    style: const TextStyle(fontSize: 11, color: Colors.blueGrey)),
+                Align(
+                  alignment: Alignment.centerLeft,
+                  child: TextButton.icon(
+                    style: TextButton.styleFrom(padding: EdgeInsets.zero),
+                    icon: const Icon(Icons.sync, size: 18),
+                    label: const Text('근무 알람 지금 다시 등록'),
+                    onPressed: () async {
+                      final m = ScaffoldMessenger.of(context);
+                      await store.rescheduleAll();
+                      _refreshStatus();
+                      m.showSnackBar(SnackBar(
+                          content: Text(store.reschedError.isNotEmpty
+                              ? '실패: ${store.reschedError}'
+                              : store.schedNote)));
+                    },
+                  ),
+                ),
               ],
               const SizedBox(height: 8),
               Row(children: [
