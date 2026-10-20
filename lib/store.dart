@@ -301,10 +301,42 @@ class Store extends ChangeNotifier {
     return out;
   }
 
-  /// 앞으로 가장 먼저 울릴 근무 알람
+  /// "이번만 끄기"로 건너뛸 회차 ('S|알람id|시각ms'). 데이터 파일에 같이 저장된다.
+  Set<String> skippedKeys = <String>{};
+
+  static String alarmKey(NextAlarm na) => 'S|${na.alarm.id}|${na.when.millisecondsSinceEpoch}';
+
+  bool isSkipped(NextAlarm na) => skippedKeys.contains(alarmKey(na));
+
+  /// 앞으로 가장 먼저 울릴 근무 알람 (이번만 끄기 한 회차는 제외)
   NextAlarm? nextAlarm() {
-    final l = planShiftAlarms(DateTime.now(), 60);
-    return l.isEmpty ? null : l.first;
+    for (final na in planShiftAlarms(DateTime.now(), 60)) {
+      if (!isSkipped(na)) return na;
+    }
+    return null;
+  }
+
+  /// 바로 다음 알람 하나만 끄기 / 되돌리기
+  Future<void> skipOnce(NextAlarm na) async {
+    skippedKeys.add(alarmKey(na));
+    await save();
+  }
+
+  Future<void> unskip(String key) async {
+    skippedKeys.remove(key);
+    await save();
+  }
+
+  /// 건너뛴 회차 중 아직 안 지난 것 (알람 탭에 "꺼둔 회차"로 표시)
+  List<NextAlarm> skippedUpcoming() =>
+      planShiftAlarms(DateTime.now(), 60).where(isSkipped).toList();
+
+  /// 알림창에서 누른 "이번 알람 끄기"를 앱에 반영
+  Future<void> pullSkipped() async {
+    final l = await nativeTakeSkipped();
+    if (l.isEmpty) return;
+    skippedKeys.addAll(l);
+    await save();
   }
 
   void _rebuildEv() {
@@ -358,6 +390,7 @@ class Store extends ChangeNotifier {
         'holidaySync': holidaySync,
         'icalUrl': icalUrl,
         'preNotice': preNoticeMin,
+        'skipped': skippedKeys.toList(),
       };
 
   /// 저장된 상태를 통째로 읽어 반영. 하나라도 실패하면 아무것도 바꾸지 않고 false.
@@ -383,7 +416,12 @@ class Store extends ChangeNotifier {
       for (final e in ((m['deviceCalSel'] as List?) ?? [])) {
         if (e is num) nSel.add(e.toInt());
       }
+      final nSkip = <String>{};
+      for (final e in ((m['skipped'] as List?) ?? [])) {
+        nSkip.add('$e');
+      }
       days = nDays;
+      skippedKeys = nSkip;
       attend = nAttend;
       attendTypes = nTypes;
       pattern = nPattern;
@@ -1033,11 +1071,18 @@ class Store extends ChangeNotifier {
       errs.add('건너뛰기 목록: $e');
     }
     skipped.addAll(await nativeTakeSkipped());
+    skipped.addAll(skippedKeys);
     skipped.removeWhere((k) {
       final parts = k.split('|');
       final ms = parts.length >= 3 ? int.tryParse(parts[2]) : null;
       return ms == null || ms < now.millisecondsSinceEpoch - 86400000;
     });
+    if (skipped.length != skippedKeys.length || !skipped.containsAll(skippedKeys)) {
+      skippedKeys = {...skipped};
+      try {
+        await _persist(); // 다시 등록과 꼬이지 않도록 저장만 (save()는 재등록을 부름)
+      } catch (_) {}
+    }
     try {
       await prefs?.setStringList('skipped', skipped.toList());
     } catch (e) {

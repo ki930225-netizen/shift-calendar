@@ -1,6 +1,7 @@
 import 'dart:async';
 
 import 'package:flutter/material.dart';
+import 'package:intl/intl.dart';
 import 'package:flutter/services.dart' show FilteringTextInputFormatter, LengthLimitingTextInputFormatter, TextInputType;
 
 import 'models.dart';
@@ -108,7 +109,9 @@ class _AlarmPageState extends State<AlarmPage> {
     super.initState();
     store.addListener(_r);
     _loadStatus();
+    store.pullSkipped();
     _timer = Timer.periodic(const Duration(seconds: 30), (_) {
+      store.pullSkipped();
       _loadStatus();
       _r();
     });
@@ -381,6 +384,24 @@ class _AlarmPageState extends State<AlarmPage> {
               child: Text(_remain(next.when),
                   style: const TextStyle(fontSize: 24, fontWeight: FontWeight.w500)),
             ),
+            Center(
+              child: Text(
+                  '${DateFormat('M월 d일 (E) HH:mm', 'ko_KR').format(next.when)} · ${shiftById(next.alarm.shiftId)?.label ?? ''} 근무',
+                  style: const TextStyle(color: Colors.grey)),
+            ),
+            const SizedBox(height: 8),
+            Center(
+              child: OutlinedButton(
+                style: OutlinedButton.styleFrom(minimumSize: const Size(220, 44)),
+                onPressed: () async {
+                  final m = ScaffoldMessenger.of(context);
+                  await store.skipOnce(next);
+                  m.showSnackBar(SnackBar(
+                      content: Text('${DateFormat('M/d HH:mm').format(next.when)} 알람을 이번만 껐어요')));
+                },
+                child: const Text('이번만 끄기', style: TextStyle(fontSize: 16)),
+              ),
+            ),
           ] else
             const Center(
               child: Padding(
@@ -388,6 +409,23 @@ class _AlarmPageState extends State<AlarmPage> {
                 child: Text('울릴 알람이 없어요',
                     style: TextStyle(fontSize: 22, color: Colors.grey)),
               ),
+            ),
+          for (final sk in store.skippedUpcoming().take(5))
+            Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 24),
+              child: Row(children: [
+                const Icon(Icons.alarm_off, size: 18, color: Colors.grey),
+                const SizedBox(width: 6),
+                Expanded(
+                  child: Text(
+                      '꺼둔 회차: ${DateFormat('M/d (E) HH:mm', 'ko_KR').format(sk.when)} ${shiftById(sk.alarm.shiftId)?.label ?? ''}',
+                      style: const TextStyle(color: Colors.grey)),
+                ),
+                TextButton(
+                  onPressed: () => store.unskip(Store.alarmKey(sk)),
+                  child: const Text('다시 켜기'),
+                ),
+              ]),
             ),
           const SizedBox(height: 8),
           _checkCard(),

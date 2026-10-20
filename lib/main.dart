@@ -99,6 +99,7 @@ class _HomeShellState extends State<HomeShell> with WidgetsBindingObserver {
   void didChangeAppLifecycleState(AppLifecycleState state) {
     if (state == AppLifecycleState.resumed) {
       store.syncDevice(); // 폰 캘린더에 새로 들어온 일정 반영
+      store.pullSkipped(); // 알림창에서 "이번 알람 끄기" 누른 것 반영
       store.rescheduleIfStale(); // 알람이 사라졌을 경우를 대비해 다시 등록
     }
   }
