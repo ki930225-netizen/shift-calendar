@@ -71,6 +71,14 @@ if "SCHEDULE_EXACT_ALARM" not in text:
 """
     text = text.replace("<application", perms + "    <application", 1)
 
+for perm in ("READ_CALENDAR", "REQUEST_IGNORE_BATTERY_OPTIMIZATIONS"):
+    if perm not in text:
+        text = text.replace(
+            "<application",
+            f'<uses-permission android:name="android.permission.{perm}"/>\n    <application',
+            1,
+        )
+
 if "ScheduledNotificationReceiver" not in text:
     receivers = """        <receiver android:exported="false"
             android:name="com.dexterous.flutterlocalnotifications.ScheduledNotificationReceiver" />
@@ -220,16 +228,112 @@ make_tones(APP / "android/app/src/main/res/raw")
 # 3-d) MainActivity: 알람 볼륨 조절 / 설정 화면 열기 기능
 KOTLIN = """package PKGNAME
 
+import android.Manifest
+import android.annotation.SuppressLint
+import android.content.ContentUris
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.media.AudioManager
 import android.net.Uri
+import android.os.Build
+import android.os.PowerManager
+import android.provider.CalendarContract
 import android.provider.Settings
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.MethodChannel
 
+@SuppressLint("MissingPermission", "NewApi", "BatteryLife")
 class MainActivity : FlutterActivity() {
+    private var pendingPerm: MethodChannel.Result? = null
+    private val calPermCode = 7001
+
+    private fun hasCal(): Boolean {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M) return true
+        return checkSelfPermission(Manifest.permission.READ_CALENDAR) == PackageManager.PERMISSION_GRANTED
+    }
+
+    private fun calendars(): List<Map<String, Any?>> {
+        val out = ArrayList<Map<String, Any?>>()
+        val proj = arrayOf(
+            CalendarContract.Calendars._ID,
+            CalendarContract.Calendars.CALENDAR_DISPLAY_NAME,
+            CalendarContract.Calendars.ACCOUNT_NAME,
+            CalendarContract.Calendars.CALENDAR_COLOR
+        )
+        val c = contentResolver.query(CalendarContract.Calendars.CONTENT_URI, proj, null, null, null)
+        if (c != null) {
+            try {
+                while (c.moveToNext()) {
+                    out.add(
+                        mapOf(
+                            "id" to c.getLong(0),
+                            "name" to (c.getString(1) ?: ""),
+                            "account" to (c.getString(2) ?: ""),
+                            "color" to c.getInt(3)
+                        )
+                    )
+                }
+            } finally {
+                c.close()
+            }
+        }
+        return out
+    }
+
+    private fun events(startMs: Long, endMs: Long, ids: List<Long>): List<Map<String, Any?>> {
+        val out = ArrayList<Map<String, Any?>>()
+        val b = CalendarContract.Instances.CONTENT_URI.buildUpon()
+        ContentUris.appendId(b, startMs)
+        ContentUris.appendId(b, endMs)
+        val proj = arrayOf(
+            CalendarContract.Instances.TITLE,
+            CalendarContract.Instances.BEGIN,
+            CalendarContract.Instances.END,
+            CalendarContract.Instances.ALL_DAY,
+            CalendarContract.Instances.CALENDAR_ID
+        )
+        var sel: String? = null
+        if (ids.isNotEmpty()) {
+            sel = CalendarContract.Instances.CALENDAR_ID + " IN (" + ids.joinToString(",") + ")"
+        }
+        val c = contentResolver.query(
+            b.build(), proj, sel, null, CalendarContract.Instances.BEGIN + " ASC"
+        )
+        if (c != null) {
+            try {
+                while (c.moveToNext()) {
+                    out.add(
+                        mapOf(
+                            "title" to (c.getString(0) ?: ""),
+                            "begin" to c.getLong(1),
+                            "end" to c.getLong(2),
+                            "allDay" to (c.getInt(3) == 1),
+                            "calId" to c.getLong(4)
+                        )
+                    )
+                }
+            } finally {
+                c.close()
+            }
+        }
+        return out
+    }
+
+    override fun onRequestPermissionsResult(
+        requestCode: Int,
+        permissions: Array<out String>,
+        grantResults: IntArray
+    ) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        if (requestCode == calPermCode) {
+            val ok = grantResults.isNotEmpty() && grantResults[0] == PackageManager.PERMISSION_GRANTED
+            pendingPerm?.success(ok)
+            pendingPerm = null
+        }
+    }
+
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
         MethodChannel(flutterEngine.dartExecutor.binaryMessenger, "shiftcal/native")
@@ -266,6 +370,37 @@ class MainActivity : FlutterActivity() {
                             i.putExtra(Settings.EXTRA_APP_PACKAGE, packageName)
                             startActivity(i)
                             result.success(true)
+                        }
+                        "isIgnoringBattery" -> {
+                            val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
+                            val ok = Build.VERSION.SDK_INT < Build.VERSION_CODES.M ||
+                                pm.isIgnoringBatteryOptimizations(packageName)
+                            result.success(ok)
+                        }
+                        "requestIgnoreBattery" -> {
+                            val i = Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS)
+                            i.data = Uri.parse("package:" + packageName)
+                            startActivity(i)
+                            result.success(true)
+                        }
+                        "hasCalendarPermission" -> result.success(hasCal())
+                        "requestCalendarPermission" -> {
+                            if (hasCal()) {
+                                result.success(true)
+                            } else {
+                                pendingPerm = result
+                                requestPermissions(arrayOf(Manifest.permission.READ_CALENDAR), calPermCode)
+                            }
+                        }
+                        "getCalendars" -> {
+                            if (hasCal()) result.success(calendars()) else result.success(emptyList<Any>())
+                        }
+                        "getEvents" -> {
+                            val s = call.argument<Number>("start")?.toLong() ?: 0L
+                            val e = call.argument<Number>("end")?.toLong() ?: 0L
+                            val raw = call.argument<List<Any>>("ids") ?: emptyList<Any>()
+                            val ids = raw.map { (it as Number).toLong() }
+                            if (hasCal()) result.success(events(s, e, ids)) else result.success(emptyList<Any>())
                         }
                         else -> result.notImplemented()
                     }

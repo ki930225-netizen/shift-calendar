@@ -11,6 +11,7 @@ import 'memo_page.dart';
 import 'models.dart';
 import 'settings_page.dart';
 import 'store.dart';
+import 'week_page.dart';
 
 const Color kRed = Color(0xFFE5495B);
 const Color kBlue = Color(0xFF3F7DE0);
@@ -31,6 +32,7 @@ Future<void> main() async {
 
 /// 화면이 뜬 뒤에 알람 초기화 → 알람 등록 → 공휴일/일정 동기화를 순서대로, 각각 안전하게 실행
 Future<void> _startup() async {
+  store.syncDevice(); // 폰 캘린더 일정은 바로 읽어서 먼저 보여준다
   try {
     await initNotifications().timeout(const Duration(seconds: 30));
   } catch (e) {
@@ -78,8 +80,28 @@ class HomeShell extends StatefulWidget {
   State<HomeShell> createState() => _HomeShellState();
 }
 
-class _HomeShellState extends State<HomeShell> {
+class _HomeShellState extends State<HomeShell> with WidgetsBindingObserver {
   int _i = 0;
+
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addObserver(this);
+  }
+
+  @override
+  void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    super.dispose();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed) {
+      store.syncDevice(); // 폰 캘린더에 새로 들어온 일정 반영
+      store.rescheduleIfStale(); // 알람이 사라졌을 경우를 대비해 다시 등록
+    }
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -170,6 +192,55 @@ class _CalendarPageState extends State<CalendarPage> {
         _selected = p;
       });
     }
+  }
+
+  Future<void> _editMonthMemo() async {
+    final ctl = TextEditingController(text: store.monthMemoOf(_focused));
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: Text('${_focused.month}월 메모'),
+        content: TextField(
+          controller: ctl,
+          autofocus: true,
+          minLines: 3,
+          maxLines: 6,
+          decoration: const InputDecoration(
+            border: OutlineInputBorder(),
+            hintText: '이 달에 기억할 내용',
+          ),
+        ),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('취소')),
+          FilledButton(onPressed: () => Navigator.pop(ctx, true), child: const Text('저장')),
+        ],
+      ),
+    );
+    if (ok == true) store.setMonthMemo(_focused, ctl.text);
+  }
+
+  Widget _monthMemoBar() {
+    final t = store.monthMemoOf(_focused);
+    return InkWell(
+      onTap: _editMonthMemo,
+      child: Container(
+        width: double.infinity,
+        color: const Color(0xFFF5F6F8),
+        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+        child: Row(children: [
+          const Icon(Icons.sticky_note_2_outlined, size: 16, color: Colors.grey),
+          const SizedBox(width: 8),
+          Expanded(
+            child: Text(
+              t.isEmpty ? '월별 메모 (눌러서 입력)' : t,
+              maxLines: 2,
+              overflow: TextOverflow.ellipsis,
+              style: TextStyle(fontSize: 13, color: t.isEmpty ? Colors.grey : Colors.black87),
+            ),
+          ),
+        ]),
+      ),
+    );
   }
 
   List<Widget> _barsFor(DateTime day) {
@@ -436,7 +507,15 @@ class _CalendarPageState extends State<CalendarPage> {
         ]),
         actions: [
           IconButton(
+            tooltip: '주별 패턴 (요일별 근무)',
+            visualDensity: VisualDensity.compact,
+            icon: const Icon(Icons.view_week),
+            onPressed: () => Navigator.of(context)
+                .push(MaterialPageRoute<void>(builder: (_) => const WeekPatternPage())),
+          ),
+          IconButton(
             tooltip: '쉬는 날(토·일·공휴일) 휴로 입력',
+            visualDensity: VisualDensity.compact,
             icon: const Icon(Icons.event_busy),
             onPressed: () => showDialog<void>(
               context: context,
@@ -449,6 +528,7 @@ class _CalendarPageState extends State<CalendarPage> {
           ),
           IconButton(
             tooltip: '근무 연속 입력',
+            visualDensity: VisualDensity.compact,
             icon: Icon(Icons.edit_calendar, color: _brushMode ? cs.primary : null),
             onPressed: () => setState(() {
               _brushMode = !_brushMode;
@@ -492,6 +572,7 @@ class _CalendarPageState extends State<CalendarPage> {
               ),
             ),
           ),
+          _monthMemoBar(),
           if (_brushMode) _brushBar(),
         ],
       ),

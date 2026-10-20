@@ -11,6 +11,7 @@ import 'package:timezone/timezone.dart' as tz;
 import 'holidays.dart';
 import 'ical.dart';
 import 'models.dart';
+import 'native.dart';
 
 final FlutterLocalNotificationsPlugin notif = FlutterLocalNotificationsPlugin();
 
@@ -22,15 +23,27 @@ class _Pending {
   final String tone;
   final bool sound;
   final bool vibrate;
+  final String key; // 같은 알람인지 구분하는 값 (알림 번호의 재료)
   _Pending(this.when, this.title, this.body, this.alarmType,
-      {this.tone = 'bell', this.sound = true, this.vibrate = true});
+      {this.tone = 'bell', this.sound = true, this.vibrate = true, this.key = ''});
 }
 
 class AlarmStatus {
   final bool notifOk;
   final bool exactOk;
   final int pending;
-  AlarmStatus(this.notifOk, this.exactOk, this.pending);
+  final bool batteryOk;
+  AlarmStatus(this.notifOk, this.exactOk, this.pending, this.batteryOk);
+}
+
+/// 같은 입력이면 항상 같은 번호가 나오는 해시 (알림 번호용)
+int _fnv(String s) {
+  int h = 0x811c9dc5;
+  for (final c in s.codeUnits) {
+    h ^= c;
+    h = (h * 0x01000193) & 0xFFFFFFFF;
+  }
+  return h & 0x3FFFFFFF;
 }
 
 List<T> _decodeList<T>(String? s, T Function(Map<String, dynamic>) f) {
@@ -59,6 +72,20 @@ class Store extends ChangeNotifier {
   List<Memo> memos = [];
   List<AlarmItem> alarms = [];
   int nextId = 1;
+  bool _loaded = false; // 불러오기에 성공해야만 저장한다 (실패한 빈 데이터로 덮어쓰기 방지)
+
+  Map<String, String> monthMemos = {}; // 'yyyy-MM' -> 월별 메모
+  Map<int, String> weekPattern = {}; // 요일(1=월..7=일) -> 근무 id
+  String? weekBefore; // 쉬는 날 전날에 넣을 근무 id
+  bool weekRestSat = true;
+  bool weekRestSun = true;
+  bool weekRestHol = true;
+
+  // 폰 캘린더
+  bool deviceCal = false;
+  List<int> deviceCalSel = [];
+  List<Ev> deviceEvs = [];
+  String deviceMsg = '';
 
   // 외부 캘린더
   bool holidaySync = true;
@@ -139,7 +166,7 @@ class Store extends ChangeNotifier {
 
   void _rebuildEv() {
     final m = <String, List<Ev>>{};
-    for (final e in [...holidayEvs, ...googleEvs]) {
+    for (final e in [...holidayEvs, ...googleEvs, ...deviceEvs]) {
       m.putIfAbsent(e.date, () => []).add(e);
     }
     evByDay = m;
@@ -156,6 +183,21 @@ class Store extends ChangeNotifier {
     memos = _decodeList<Memo>(p.getString('v2_memos'), Memo.fromJson);
     alarms = _decodeList<AlarmItem>(p.getString('v2_alarms'), AlarmItem.fromJson);
     nextId = p.getInt('v2_nextId') ?? 1;
+    monthMemos = _decodeStrMap(p.getString('v2_monthMemos'));
+    final wk = _decodeStrMap(p.getString('v2_week'));
+    weekPattern = {};
+    wk.forEach((k, v) {
+      final n = int.tryParse(k);
+      if (n != null) weekPattern[n] = v;
+    });
+    weekBefore = p.getString('v2_weekBefore');
+    weekRestSat = p.getBool('v2_weekSat') ?? true;
+    weekRestSun = p.getBool('v2_weekSun') ?? true;
+    weekRestHol = p.getBool('v2_weekHol') ?? true;
+    deviceCal = p.getBool('deviceCal') ?? false;
+    deviceCalSel =
+        (p.getStringList('deviceCalSel') ?? <String>[]).map((e) => int.tryParse(e) ?? -1).toList();
+    deviceCalSel.removeWhere((e) => e < 0);
 
     holidaySync = p.getBool('holidaySync') ?? true;
     icalUrl = p.getString('icalUrl') ?? '';
@@ -163,11 +205,13 @@ class Store extends ChangeNotifier {
     holidayEvs = _decodeList<Ev>(p.getString('ev_holiday'), Ev.fromJson);
     googleEvs = _decodeList<Ev>(p.getString('ev_google'), Ev.fromJson);
     _rebuildEv();
+    _loaded = true;
     notifyListeners();
   }
 
   Future<void> save({bool resched = true}) async {
     notifyListeners();
+    if (!_loaded) return; // 불러오기에 실패한 상태면 기존 저장 데이터를 건드리지 않는다
     final p = await SharedPreferences.getInstance();
     await p.setString('v2_days', jsonEncode(days));
     await p.setString('v2_attend', jsonEncode(attend));
@@ -176,6 +220,19 @@ class Store extends ChangeNotifier {
     await p.setString('v2_memos', jsonEncode(memos.map((e) => e.toJson()).toList()));
     await p.setString('v2_alarms', jsonEncode(alarms.map((e) => e.toJson()).toList()));
     await p.setInt('v2_nextId', nextId);
+    await p.setString('v2_monthMemos', jsonEncode(monthMemos));
+    await p.setString(
+        'v2_week', jsonEncode(weekPattern.map((k, v) => MapEntry(k.toString(), v))));
+    if (weekBefore == null) {
+      await p.remove('v2_weekBefore');
+    } else {
+      await p.setString('v2_weekBefore', weekBefore!);
+    }
+    await p.setBool('v2_weekSat', weekRestSat);
+    await p.setBool('v2_weekSun', weekRestSun);
+    await p.setBool('v2_weekHol', weekRestHol);
+    await p.setBool('deviceCal', deviceCal);
+    await p.setStringList('deviceCalSel', deviceCalSel.map((e) => '$e').toList());
     await p.setBool('holidaySync', holidaySync);
     await p.setString('icalUrl', icalUrl);
     if (resched) await rescheduleAll();
@@ -219,6 +276,55 @@ class Store extends ChangeNotifier {
       }
     }
     save();
+  }
+
+  /// 주별 패턴에서 그 날짜에 들어갈 근무 (없으면 null = 건드리지 않음)
+  /// 우선순위: 쉬는 날 → '휴' / 쉬는 날 전날 → beforeRest / 그 외 → 요일에 정한 근무
+  String? weekShiftFor(DateTime d, Map<int, String> week,
+      {bool restSat = false, bool restSun = false, bool restHol = false, String? beforeRest}) {
+    final anyRest = restSat || restSun || restHol;
+    if (anyRest && isRestDay(d, sat: restSat, sun: restSun, hol: restHol)) return 'OFF';
+    final next = DateTime(d.year, d.month, d.day + 1);
+    if (anyRest &&
+        beforeRest != null &&
+        isRestDay(next, sat: restSat, sun: restSun, hol: restHol)) {
+      return beforeRest;
+    }
+    return week[d.weekday];
+  }
+
+  /// 주별(요일별) 패턴 적용. 비워 둔 요일은 건드리지 않는다.
+  void applyWeekPattern(DateTime start, int count, Map<int, String> week,
+      {bool restSat = false, bool restSun = false, bool restHol = false, String? beforeRest}) {
+    weekPattern = Map<int, String>.of(week);
+    weekBefore = beforeRest;
+    weekRestSat = restSat;
+    weekRestSun = restSun;
+    weekRestHol = restHol;
+    for (int i = 0; i < count; i++) {
+      final d = DateTime(start.year, start.month, start.day + i);
+      final sid = weekShiftFor(d, week,
+          restSat: restSat, restSun: restSun, restHol: restHol, beforeRest: beforeRest);
+      if (sid != null) days[dayKey(d)] = sid;
+    }
+    save();
+  }
+
+  // ── 월별 메모 ──
+
+  String monthKey(DateTime d) => '${d.year}-${two(d.month)}';
+
+  String monthMemoOf(DateTime d) => monthMemos[monthKey(d)] ?? '';
+
+  void setMonthMemo(DateTime d, String text) {
+    final k = monthKey(d);
+    final t = text.trim();
+    if (t.isEmpty) {
+      monthMemos.remove(k);
+    } else {
+      monthMemos[k] = t;
+    }
+    save(resched: false);
   }
 
   // ── 메모 ──
@@ -289,6 +395,7 @@ class Store extends ChangeNotifier {
         'memos': memos.map((e) => e.toJson()).toList(),
         'alarms': alarms.map((e) => e.toJson()).toList(),
         'nextId': nextId,
+        'monthMemos': monthMemos,
       });
 
   Future<bool> importJson(String s) async {
@@ -305,6 +412,7 @@ class Store extends ChangeNotifier {
       final newAlarms = (m['alarms'] as List? ?? [])
           .map((e) => AlarmItem.fromJson(Map<String, dynamic>.from(e)))
           .toList();
+      monthMemos = _decodeStrMap(jsonEncode(m['monthMemos'] ?? {}));
       days = newDays;
       attend = newAttend;
       attendTypes = newTypes;
@@ -316,6 +424,102 @@ class Store extends ChangeNotifier {
       return true;
     } catch (_) {
       return false;
+    }
+  }
+
+  // ── 폰 캘린더 직접 연동 ──
+
+  /// 휴일 전용 캘린더(삼성 휴일 등)는 우리 앱이 이미 공휴일을 표시하므로 기본 선택에서 뺀다
+  List<int> defaultCalSel(List<Map<String, dynamic>> cals) {
+    final out = <int>[];
+    for (final c in cals) {
+      final n = '${c['name']}'.toLowerCase();
+      if (n.contains('holiday') || n.contains('휴일')) continue;
+      final id = c['id'];
+      if (id is num) out.add(id.toInt());
+    }
+    return out;
+  }
+
+  /// 권한을 요청하고 연동을 켠다. 결과 안내 문구를 돌려준다.
+  Future<String> enableDeviceCal() async {
+    final ok = await requestCalendarPermission();
+    if (!ok) {
+      deviceCal = false;
+      await save(resched: false);
+      return '캘린더 권한이 필요해요. 권한 창에서 "허용"을 눌러주세요';
+    }
+    deviceCal = true;
+    if (deviceCalSel.isEmpty) {
+      deviceCalSel = defaultCalSel(await deviceCalendars());
+    }
+    await save(resched: false);
+    await syncDevice();
+    return deviceMsg;
+  }
+
+  Future<void> disableDeviceCal() async {
+    deviceCal = false;
+    deviceEvs = [];
+    deviceMsg = '';
+    _rebuildEv();
+    await save(resched: false);
+  }
+
+  /// 폰에 들어 있는 캘린더 일정을 읽어온다 (구글/삼성 캘린더에 등록된 일정이 그대로 보인다)
+  Future<void> syncDevice() async {
+    if (kIsWeb || !deviceCal) return;
+    try {
+      if (!await hasCalendarPermission()) {
+        deviceMsg = '캘린더 권한이 없어요 (설정에서 다시 켜 주세요)';
+        notifyListeners();
+        return;
+      }
+      if (deviceCalSel.isEmpty) {
+        deviceMsg = '연동할 캘린더를 선택하세요';
+        deviceEvs = [];
+        _rebuildEv();
+        notifyListeners();
+        return;
+      }
+      final now = DateTime.now();
+      final from = DateTime(now.year - 1, 1, 1);
+      final to = DateTime(now.year + 3, 1, 1);
+      final rows = await deviceEvents(from.millisecondsSinceEpoch, to.millisecondsSinceEpoch, deviceCalSel);
+      final out = <Ev>[];
+      final seen = <String>{};
+      void add(Ev e) {
+        if (seen.add('${e.date}|${e.title}|${e.time}')) out.add(e);
+      }
+
+      for (final r in rows) {
+        final raw = '${r['title'] ?? ''}'.trim();
+        final title = raw.isEmpty ? '(제목 없음)' : raw;
+        final b = (r['begin'] as num).toInt();
+        final e = (r['end'] as num).toInt();
+        if (r['allDay'] == true) {
+          final bs = DateTime.fromMillisecondsSinceEpoch(b, isUtc: true);
+          final es = DateTime.fromMillisecondsSinceEpoch(e, isUtc: true);
+          final s0 = DateTime(bs.year, bs.month, bs.day);
+          final e0 = DateTime(es.year, es.month, es.day);
+          int span = e0.difference(s0).inDays;
+          if (span < 1) span = 1;
+          if (span > 31) span = 31;
+          for (int k = 0; k < span; k++) {
+            add(Ev(dayKey(DateTime(s0.year, s0.month, s0.day + k)), title));
+          }
+        } else {
+          final l = DateTime.fromMillisecondsSinceEpoch(b);
+          add(Ev(dayKey(l), title, time: '${two(l.hour)}:${two(l.minute)}'));
+        }
+      }
+      deviceEvs = out;
+      deviceMsg = '폰 일정 ${out.length}건';
+      _rebuildEv();
+      notifyListeners();
+    } catch (e) {
+      deviceMsg = '폰 일정 읽기 실패(${_short(e)})';
+      notifyListeners();
     }
   }
 
@@ -374,18 +578,48 @@ class Store extends ChangeNotifier {
 
   // ── 알람 등록 ──
 
-  /// 근무별 알람 + 메모 알림을 모두 다시 등록한다. 앱을 열 때마다 자동 실행.
+  DateTime? _lastResched;
+  bool _rescheduling = false;
+  bool _reschedAgain = false;
+
+  /// 근무별 알람 + 메모 알림을 다시 등록한다. 앱을 열 때와 설정을 바꿀 때마다 자동 실행.
+  /// (동시에 두 번 돌지 않도록 한 번에 하나씩만 처리한다)
   Future<void> rescheduleAll() async {
-    try {
-      await _rescheduleImpl();
-    } catch (e) {
-      debugPrint('알람 등록 실패: $e');
+    if (_rescheduling) {
+      _reschedAgain = true;
+      return;
     }
+    _rescheduling = true;
+    try {
+      do {
+        _reschedAgain = false;
+        try {
+          await _rescheduleImpl();
+          _lastResched = DateTime.now();
+        } catch (e) {
+          debugPrint('알람 등록 실패: $e');
+        }
+      } while (_reschedAgain);
+    } finally {
+      _rescheduling = false;
+    }
+  }
+
+  /// 앱으로 돌아올 때: 10분 안에 이미 등록했다면 건너뛴다
+  Future<void> rescheduleIfStale() async {
+    final l = _lastResched;
+    if (l != null && DateTime.now().difference(l) < const Duration(minutes: 10)) return;
+    await rescheduleAll();
   }
 
   Future<void> _rescheduleImpl() async {
     if (kIsWeb) return; // PC 크롬 미리보기에서는 알람 기능 없음
-    await notif.cancelAll();
+    final prefs = await SharedPreferences.getInstance();
+    // 예전 방식(번호 1,2,3...)으로 등록된 알림은 한 번만 전부 지운다
+    if (!(prefs.getBool('sched_v3') ?? false)) {
+      await notif.cancelAll();
+      await prefs.setBool('sched_v3', true);
+    }
     final now = DateTime.now();
     final pend = <_Pending>[];
 
@@ -397,7 +631,10 @@ class Store extends ChangeNotifier {
       final String day = a.dayOffset < 0 ? '내일' : (a.dayOffset > 0 ? '어제' : '오늘');
       final body = a.label.isNotEmpty ? a.label : '$day ${shift.label} 근무 · ${fmtHM(a.minutes)}';
       pend.add(_Pending(na.when, '${shift.label} 근무 알람', body, true,
-          tone: a.tone, sound: a.sound, vibrate: a.vibrate));
+          tone: a.tone,
+          sound: a.sound,
+          vibrate: a.vibrate,
+          key: 'S|${a.id}|${na.when.millisecondsSinceEpoch}'));
     }
 
     // 2) 메모 알림: 앞으로 120일
@@ -409,15 +646,37 @@ class Store extends ChangeNotifier {
       final when = DateTime(sd.year, sd.month, sd.day, base ~/ 60, base % 60)
           .subtract(Duration(minutes: m.alarmBefore));
       if (when.isBefore(now) || when.isAfter(limit)) continue;
-      pend.add(_Pending(when, '메모 알림', m.title.isEmpty ? '(제목 없음)' : m.title, false));
+      pend.add(_Pending(when, '메모 알림', m.title.isEmpty ? '(제목 없음)' : m.title, false,
+          key: 'M|${m.id}|${when.millisecondsSinceEpoch}'));
     }
 
     // 안드로이드 예약 한도(약 500개)를 넘지 않도록 가까운 순서로 450개까지
     pend.sort((a, b) => a.when.compareTo(b.when));
-    int id = 1;
-    for (final p in pend.take(450)) {
-      await _scheduleOne(id++, p);
+    final take = pend.take(450).toList();
+
+    // 같은 알람은 항상 같은 번호로 등록 → 다시 등록해도 덮어쓸 뿐이라 중간에 앱이 멈춰도 알람이 사라지지 않는다
+    final ids = <int>[];
+    final used = <int>{};
+    for (final p in take) {
+      var id = _fnv(p.key);
+      while (used.contains(id) || id == 9001 || id == 9002) {
+        id = (id + 1) & 0x3FFFFFFF;
+      }
+      used.add(id);
+      ids.add(id);
     }
+    for (int i = 0; i < take.length; i++) {
+      await _scheduleOne(ids[i], take[i]);
+    }
+
+    // 더 이상 필요 없는(지워졌거나 바뀐) 알림만 취소
+    try {
+      final pending = await notif.pendingNotificationRequests();
+      for (final r in pending) {
+        if (r.id == 9001 || r.id == 9002) continue;
+        if (!used.contains(r.id)) await notif.cancel(r.id);
+      }
+    } catch (_) {}
   }
 
   /// 알람 채널: 소리/진동 조합마다 채널이 따로 필요하다 (안드로이드 규칙)
@@ -470,21 +729,26 @@ class Store extends ChangeNotifier {
   Future<String> _scheduleOne(int id, _Pending p) async {
     final when = tz.TZDateTime.from(p.when, tz.local);
     final details = _detailsFor(p);
-    Future<void> schedule(AndroidScheduleMode mode) =>
-        notif.zonedSchedule(id, p.title, p.body, when, details, androidScheduleMode: mode);
-    try {
-      await schedule(AndroidScheduleMode.exactAllowWhileIdle);
-      return 'exact';
-    } catch (_) {
-      // 정확한 알람 권한이 없으면 덜 정확한 방식으로라도 등록
+    // 근무 알람은 "알람 시계" 방식(절전 모드에서도 가장 잘 울림)으로 먼저 시도한다
+    final modes = p.alarmType
+        ? <AndroidScheduleMode>[
+            AndroidScheduleMode.alarmClock,
+            AndroidScheduleMode.exactAllowWhileIdle,
+            AndroidScheduleMode.inexactAllowWhileIdle,
+          ]
+        : <AndroidScheduleMode>[
+            AndroidScheduleMode.exactAllowWhileIdle,
+            AndroidScheduleMode.inexactAllowWhileIdle,
+          ];
+    for (final mode in modes) {
       try {
-        await schedule(AndroidScheduleMode.inexactAllowWhileIdle);
-        return 'inexact';
+        await notif.zonedSchedule(id, p.title, p.body, when, details, androidScheduleMode: mode);
+        return mode == AndroidScheduleMode.inexactAllowWhileIdle ? 'inexact' : 'exact';
       } catch (e) {
-        debugPrint('알람 예약 실패: $e');
-        return 'fail';
+        debugPrint('알람 예약 실패($mode): $e');
       }
     }
+    return 'fail';
   }
 
   /// 알람 테스트. now=true 면 바로 울리고, 아니면 10초 뒤에 울린다.
@@ -530,16 +794,17 @@ class Store extends ChangeNotifier {
   }
 
   Future<AlarmStatus> alarmStatus() async {
-    if (kIsWeb) return AlarmStatus(false, false, 0);
+    if (kIsWeb) return AlarmStatus(false, false, 0, false);
     try {
       final a =
           notif.resolvePlatformSpecificImplementation<AndroidFlutterLocalNotificationsPlugin>();
       final n = await a?.areNotificationsEnabled() ?? false;
       final e = await a?.canScheduleExactNotifications() ?? false;
       final p = (await notif.pendingNotificationRequests()).length;
-      return AlarmStatus(n, e, p);
+      final bt = await isIgnoringBattery();
+      return AlarmStatus(n, e, p, bt);
     } catch (_) {
-      return AlarmStatus(false, false, 0);
+      return AlarmStatus(false, false, 0, false);
     }
   }
 }

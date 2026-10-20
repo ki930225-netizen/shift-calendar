@@ -234,6 +234,7 @@ Future<int?> pickTime24(BuildContext context, int initMin) async {
   final p = await showTimePicker(
     context: context,
     initialTime: TimeOfDay(hour: initMin ~/ 60, minute: initMin % 60),
+    initialEntryMode: TimePickerEntryMode.input, // 처음부터 숫자 입력 칸으로
     builder: (ctx, child) => MediaQuery(
       data: MediaQuery.of(ctx).copyWith(alwaysUse24HourFormat: true),
       child: child ?? const SizedBox.shrink(),

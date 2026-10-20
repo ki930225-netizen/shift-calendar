@@ -1,6 +1,7 @@
 import 'dart:async';
 
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart' show FilteringTextInputFormatter, LengthLimitingTextInputFormatter, TextInputType;
 
 import 'models.dart';
 import 'native.dart';
@@ -198,6 +199,9 @@ class _AlarmPageState extends State<AlarmPage> {
                     fixText: '설정 열기', onFix: () => openNotificationSettings()),
                 _statusRow('정확한 알람 허용', s.exactOk,
                     fixText: '허용하기', onFix: () => store.requestExact().then((_) => _refreshStatus())),
+                _statusRow('배터리 제한 없음 (절전으로 알람이 꺼지는 것 방지)', s.batteryOk,
+                    fixText: '허용하기',
+                    onFix: () => requestIgnoreBattery().then((_) => _refreshStatus())),
                 Padding(
                   padding: const EdgeInsets.symmetric(vertical: 2),
                   child: Row(children: [
@@ -243,7 +247,8 @@ class _AlarmPageState extends State<AlarmPage> {
                     child: Text(
                       '1. 위 "알림 허용", "정확한 알람 허용"이 모두 초록색인지 확인\n'
                       '2. 근무 알람은 달력에 그 근무(예: N)가 입력된 날에만 울려요\n'
-                      '3. 갤럭시: 설정 > 배터리 > 백그라운드 사용 제한 에서 이 앱이 "절전 상태"로 들어가 있으면 빼 주세요\n'
+                      '3. 갤럭시: 설정 > 배터리 > 백그라운드 사용 제한 에서 "사용하지 않는 앱 절전"을 끄고, '
+                      '"절전 상태 앱"·"깊은 절전 상태 앱" 목록에 이 앱이 있으면 빼 주세요\n'
                       '4. 방해금지 모드에서는 알람 소리가 막힐 수 있어요\n'
                       '5. 알람 볼륨이 0이 아닌지 확인',
                       style: TextStyle(fontSize: 12, height: 1.5),
@@ -401,7 +406,11 @@ class AlarmEditPage extends StatefulWidget {
 }
 
 class _AlarmEditPageState extends State<AlarmEditPage> {
-  late int minutes = widget.alarm?.minutes ?? 7 * 60;
+  late final int _initMin = widget.alarm?.minutes ?? 7 * 60;
+  late final TextEditingController hCtl = TextEditingController(text: two(_initMin ~/ 60));
+  late final TextEditingController mCtl = TextEditingController(text: two(_initMin % 60));
+  final FocusNode hFocus = FocusNode();
+  final FocusNode mFocus = FocusNode();
   late String sid = widget.alarm?.shiftId ?? 'D';
   late Set<int> dows = Set<int>.of(widget.alarm?.days ?? const <int>[1, 2, 3, 4, 5, 6, 7]);
   late int offset = widget.alarm?.dayOffset ?? 0;
@@ -411,9 +420,81 @@ class _AlarmEditPageState extends State<AlarmEditPage> {
   late final TextEditingController label = TextEditingController(text: widget.alarm?.label ?? '');
 
   @override
+  void initState() {
+    super.initState();
+    hFocus.addListener(() => _onFocus(hFocus, hCtl, 23));
+    mFocus.addListener(() => _onFocus(mFocus, mCtl, 59));
+  }
+
+  @override
   void dispose() {
     label.dispose();
+    hCtl.dispose();
+    mCtl.dispose();
+    hFocus.dispose();
+    mFocus.dispose();
     super.dispose();
+  }
+
+  /// 칸에 들어가면 숫자 전체 선택(바로 덮어쓰기), 나오면 범위/두 자리로 정리
+  void _onFocus(FocusNode f, TextEditingController c, int max) {
+    if (f.hasFocus) {
+      c.selection = TextSelection(baseOffset: 0, extentOffset: c.text.length);
+    } else {
+      final n = (int.tryParse(c.text) ?? 0).clamp(0, max).toInt();
+      c.text = two(n);
+    }
+  }
+
+  int get _minutes {
+    final h = (int.tryParse(hCtl.text) ?? 0).clamp(0, 23).toInt();
+    final m = (int.tryParse(mCtl.text) ?? 0).clamp(0, 59).toInt();
+    return h * 60 + m;
+  }
+
+  Widget _timeField(TextEditingController c, FocusNode f, int max, bool isHour) {
+    return SizedBox(
+      width: 96,
+      child: TextField(
+        controller: c,
+        focusNode: f,
+        textAlign: TextAlign.center,
+        keyboardType: TextInputType.number,
+        textInputAction: isHour ? TextInputAction.next : TextInputAction.done,
+        inputFormatters: [
+          FilteringTextInputFormatter.digitsOnly,
+          LengthLimitingTextInputFormatter(2),
+        ],
+        style: const TextStyle(fontSize: 56, fontWeight: FontWeight.w300),
+        decoration: const InputDecoration(
+          border: InputBorder.none,
+          isDense: true,
+          counterText: '',
+        ),
+        onTap: () => c.selection = TextSelection(baseOffset: 0, extentOffset: c.text.length),
+        onChanged: (v) {
+          if (v.length == 2) {
+            final n = int.tryParse(v) ?? 0;
+            if (n > max) {
+              c.value = TextEditingValue(
+                text: two(max),
+                selection: const TextSelection.collapsed(offset: 2),
+              );
+            }
+            if (isHour) {
+              mFocus.requestFocus(); // 시 두 자리를 치면 바로 분 칸으로
+            } else {
+              f.unfocus();
+            }
+          }
+        },
+        onSubmitted: (_) {
+          if (isHour) {
+            mFocus.requestFocus();
+          }
+        },
+      ),
+    );
   }
 
   void _save() {
@@ -426,7 +507,7 @@ class _AlarmEditPageState extends State<AlarmEditPage> {
     final sortedDays = dows.toList()..sort();
     store.upsertAlarm(AlarmItem(
       id: a?.id ?? store.newId(),
-      minutes: minutes,
+      minutes: _minutes,
       shiftId: sid,
       enabled: a?.enabled ?? true,
       days: sortedDays,
@@ -477,18 +558,12 @@ class _AlarmEditPageState extends State<AlarmEditPage> {
             decoration:
                 BoxDecoration(color: Colors.white, borderRadius: BorderRadius.circular(14)),
             child: Column(children: [
-              InkWell(
-                onTap: () async {
-                  final v = await pickTime24(context, minutes);
-                  if (v != null) setState(() => minutes = v);
-                },
-                child: Padding(
-                  padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 4),
-                  child: Text(fmtHM(minutes),
-                      style: const TextStyle(fontSize: 56, fontWeight: FontWeight.w300)),
-                ),
-              ),
-              const Text('시각을 눌러 변경 (24시간제)',
+              Row(mainAxisAlignment: MainAxisAlignment.center, children: [
+                _timeField(hCtl, hFocus, 23, true),
+                const Text(':', style: TextStyle(fontSize: 52, fontWeight: FontWeight.w300)),
+                _timeField(mCtl, mFocus, 59, false),
+              ]),
+              const Text('숫자를 누르고 바로 입력하세요 (24시간제, 예: 18 : 30)',
                   style: TextStyle(color: Colors.grey, fontSize: 12)),
             ]),
           ),

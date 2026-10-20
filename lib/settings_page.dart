@@ -3,7 +3,9 @@ import 'package:flutter/services.dart' show Clipboard, ClipboardData;
 import 'package:intl/intl.dart';
 
 import 'models.dart';
+import 'native.dart';
 import 'store.dart';
+import 'week_page.dart';
 
 // ───────────────────────── 설정 탭 ─────────────────────────
 
@@ -32,6 +34,57 @@ class _SettingsPageState extends State<SettingsPage> {
 
   void _r() {
     if (mounted) setState(() {});
+  }
+
+  Future<void> _pickCalendars() async {
+    final cals = await deviceCalendars();
+    if (!mounted) return;
+    if (cals.isEmpty) {
+      ScaffoldMessenger.of(context)
+          .showSnackBar(const SnackBar(content: Text('폰에서 캘린더를 찾지 못했어요 (권한을 확인하세요)')));
+      return;
+    }
+    final sel = <int>{...store.deviceCalSel};
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => StatefulBuilder(
+        builder: (ctx, setS) => AlertDialog(
+          title: const Text('연동할 캘린더'),
+          content: SizedBox(
+            width: double.maxFinite,
+            child: ListView(
+              shrinkWrap: true,
+              children: [
+                for (final c in cals)
+                  CheckboxListTile(
+                    contentPadding: EdgeInsets.zero,
+                    dense: true,
+                    title: Text('${c['name']}'),
+                    subtitle: Text('${c['account']}', style: const TextStyle(fontSize: 11)),
+                    value: sel.contains((c['id'] as num).toInt()),
+                    onChanged: (v) => setS(() {
+                      final id = (c['id'] as num).toInt();
+                      if (v == true) {
+                        sel.add(id);
+                      } else {
+                        sel.remove(id);
+                      }
+                    }),
+                  ),
+              ],
+            ),
+          ),
+          actions: [
+            TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('취소')),
+            FilledButton(onPressed: () => Navigator.pop(ctx, true), child: const Text('확인')),
+          ],
+        ),
+      ),
+    );
+    if (ok != true) return;
+    store.deviceCalSel = sel.toList();
+    await store.save(resched: false);
+    await store.syncDevice();
   }
 
   Future<void> _restore() async {
@@ -88,6 +141,51 @@ class _SettingsPageState extends State<SettingsPage> {
             onTap: () => showDialog(
                 context: context, builder: (_) => const PatternDialog(restOnly: true)),
           ),
+          ListTile(
+            contentPadding: EdgeInsets.zero,
+            leading: const Icon(Icons.view_week),
+            title: const Text('주별 패턴 (요일별 근무)'),
+            subtitle: const Text('예) 월~목 N, 금 D, 쉬는 날 전날은 D, 토·일·공휴일은 휴'),
+            trailing: const Icon(Icons.chevron_right),
+            onTap: () => Navigator.of(context)
+                .push(MaterialPageRoute<void>(builder: (_) => const WeekPatternPage())),
+          ),
+          const Divider(height: 32),
+          Text('폰 캘린더 연동', style: Theme.of(context).textTheme.titleMedium),
+          SwitchListTile(
+            contentPadding: EdgeInsets.zero,
+            title: const Text('폰에 등록된 캘린더 바로 가져오기'),
+            subtitle: const Text('구글·삼성 캘린더에 들어 있는 일정(제미나이로 등록한 일정 포함)이 '
+                '주소 입력 없이 달력에 나옵니다.'),
+            value: store.deviceCal,
+            onChanged: (v) async {
+              if (v) {
+                final m = await store.enableDeviceCal();
+                if (!context.mounted) return;
+                ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(m)));
+              } else {
+                await store.disableDeviceCal();
+              }
+            },
+          ),
+          if (store.deviceCal) ...[
+            ListTile(
+              contentPadding: EdgeInsets.zero,
+              leading: const Icon(Icons.fact_check_outlined),
+              title: const Text('연동할 캘린더 선택'),
+              subtitle: Text(store.deviceMsg.isEmpty ? '선택한 캘린더의 일정만 가져옵니다' : store.deviceMsg),
+              trailing: const Icon(Icons.chevron_right),
+              onTap: _pickCalendars,
+            ),
+            Align(
+              alignment: Alignment.centerLeft,
+              child: TextButton.icon(
+                onPressed: () => store.syncDevice(),
+                icon: const Icon(Icons.sync),
+                label: const Text('지금 다시 읽기'),
+              ),
+            ),
+          ],
           const Divider(height: 32),
           Text('공휴일', style: Theme.of(context).textTheme.titleMedium),
           SwitchListTile(
@@ -103,10 +201,10 @@ class _SettingsPageState extends State<SettingsPage> {
             },
           ),
           const Divider(height: 32),
-          Text('내 구글 캘린더 연결', style: Theme.of(context).textTheme.titleMedium),
+          Text('내 구글 캘린더 연결 (인터넷 주소 방식)', style: Theme.of(context).textTheme.titleMedium),
           const SizedBox(height: 8),
-          const Text('제미나이로 등록한 일정은 구글 캘린더에 들어가므로, '
-              '아래에 "비공개 iCal 주소"를 넣으면 이 앱 달력에 자동으로 나타납니다.'),
+          const Text('위의 "폰 캘린더 연동"을 쓰면 이 항목은 필요 없어요. '
+              '폰이 아닌 다른 구글 캘린더를 보고 싶을 때만 "비공개 iCal 주소"를 넣으세요.'),
           const SizedBox(height: 12),
           TextField(
             controller: _url,
