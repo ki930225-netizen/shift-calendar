@@ -187,6 +187,10 @@ else:
 # 3-b2) 릴리스 빌드에서 알림 플러그인(Gson)이 깨지지 않도록 보호 규칙
 (APP / "android/app/proguard-rules.pro").write_text(
     "-keep class com.dexterous.** { *; }\n"
+    "-keep class io.flutter.plugins.** { *; }\n"
+    "-keep class androidx.datastore.** { *; }\n"
+    "-keep class kotlin.coroutines.** { *; }\n"
+    "-keep class kotlinx.coroutines.** { *; }\n"
     "-keep class com.google.gson.reflect.TypeToken { *; }\n"
     "-keep class * extends com.google.gson.reflect.TypeToken\n"
     "-keepattributes Signature\n"
@@ -278,6 +282,8 @@ import android.net.Uri
 import android.os.Build
 import android.os.PowerManager
 import android.provider.CalendarContract
+import android.provider.OpenableColumns
+import java.io.File
 import android.provider.Settings
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
@@ -289,6 +295,8 @@ import org.json.JSONObject
 class MainActivity : FlutterActivity() {
     private var pendingPerm: MethodChannel.Result? = null
     private val calPermCode = 7001
+    private val pickCode = 7002
+    private var pendingPick: MethodChannel.Result? = null
 
     private fun hasCal(): Boolean {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M) return true
@@ -360,6 +368,42 @@ class MainActivity : FlutterActivity() {
             }
         }
         return out
+    }
+
+    @Deprecated("Deprecated in Java")
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        super.onActivityResult(requestCode, resultCode, data)
+        if (requestCode != pickCode) return
+        val res = pendingPick
+        pendingPick = null
+        if (res == null) return
+        val uri = data?.data
+        if (resultCode != RESULT_OK || uri == null) {
+            res.success(null)
+            return
+        }
+        try {
+            var name = "내 음악"
+            val c = contentResolver.query(uri, null, null, null, null)
+            if (c != null) {
+                try {
+                    val idx = c.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+                    if (c.moveToFirst() && idx >= 0) name = c.getString(idx) ?: name
+                } finally {
+                    c.close()
+                }
+            }
+            val dst = File(filesDir, "custom_alarm_sound")
+            val tmp = File(filesDir, "custom_alarm_sound.tmp")
+            contentResolver.openInputStream(uri)!!.use { input ->
+                tmp.outputStream().use { out -> input.copyTo(out) }
+            }
+            if (dst.exists()) dst.delete()
+            tmp.renameTo(dst)
+            res.success(name)
+        } catch (e: Exception) {
+            res.error("pick", e.toString(), null)
+        }
     }
 
     override fun onRequestPermissionsResult(
@@ -443,6 +487,13 @@ class MainActivity : FlutterActivity() {
                             val raw = call.argument<List<Any>>("ids") ?: emptyList<Any>()
                             val ids = raw.map { (it as Number).toLong() }
                             if (hasCal()) result.success(events(s, e, ids)) else result.success(emptyList<Any>())
+                        }
+                        "pickAlarmSound" -> {
+                            pendingPick = result
+                            val i = Intent(Intent.ACTION_OPEN_DOCUMENT)
+                            i.addCategory(Intent.CATEGORY_OPENABLE)
+                            i.type = "audio/*"
+                            startActivityForResult(i, pickCode)
                         }
                         "alarmSetAll" -> {
                             val raw = call.argument<List<Map<String, Any?>>>("alarms") ?: emptyList()
@@ -534,13 +585,14 @@ object AlarmKit {
     const val SNOOZE_BASE = 0x40000000
     const val RING_NOTIF = 0x3FFFFF01
     const val CH_RING = "ring_screen_v1"
-    const val CH_NOTICE = "ring_notice_v1"
+    const val CH_NOTICE = "ring_notice_v2"
     const val CH_FALLBACK = "ring_fallback_v1"
     const val A_RING = "shiftcal.RING"
     const val A_NOTICE = "shiftcal.NOTICE"
     const val A_SKIP = "shiftcal.SKIP"
     const val A_SNOOZE = "shiftcal.SNOOZE"
     const val A_STOP = "shiftcal.STOP"
+    const val A_UNSNOOZE = "shiftcal.UNSNOOZE"
 
     var lastError: String = ""
 
@@ -609,7 +661,8 @@ object AlarmKit {
                 lastError = e2.toString()
             }
         }
-        val nt = o.optLong("noticeAt", 0L)
+        var nt = o.optLong("noticeAt", 0L)
+        if (nt in 1..now && at - now > 60000L) nt = now + 3000L
         if (nt > now) {
             val np = bcast(c, A_NOTICE, id, o)
             try {
@@ -772,8 +825,11 @@ object AlarmKit {
             nm.createNotificationChannel(ch)
         }
         if (nm.getNotificationChannel(CH_NOTICE) == null) {
-            val ch = NotificationChannel(CH_NOTICE, "알람 미리 알림", NotificationManager.IMPORTANCE_LOW)
-            ch.description = "알람이 울리기 전 N분 뒤 알람 표시"
+            val ch = NotificationChannel(CH_NOTICE, "알람 미리 알림", NotificationManager.IMPORTANCE_DEFAULT)
+            ch.description = "알람이 울리기 전 N분 뒤 알람 / 다시 울림 예정 표시"
+            ch.setSound(null, null)
+            ch.enableVibration(false)
+            ch.lockscreenVisibility = Notification.VISIBILITY_PUBLIC
             nm.createNotificationChannel(ch)
         }
         if (nm.getNotificationChannel(CH_FALLBACK) == null) {
@@ -845,6 +901,28 @@ object AlarmKit {
         if (!body.endsWith("(다시 울림)")) n.put("body", "$body (다시 울림)")
         scheduleOne(c, n)
         upsert(c, n)
+        try {
+            ensureChannels(c)
+            val sid = n.optInt("id")
+            val at = n.optLong("at")
+            val hm = SimpleDateFormat("HH:mm", Locale.KOREAN).format(Date(at))
+            val b = builder(c, CH_NOTICE)
+                .setSmallIcon(c.applicationInfo.icon)
+                .setContentTitle("다시 울림 $hm 예정 · " + n.optString("title", "알람"))
+                .setContentText("${min}분 후에 다시 울려요. 그만 울리려면 아래 버튼을 누르세요")
+                .setWhen(at)
+                .setShowWhen(true)
+                .setUsesChronometer(true)
+                .setOngoing(true)
+                .setOnlyAlertOnce(true)
+                .setContentIntent(launch(c))
+                .addAction(action("다시 울림 취소", bcast(c, A_UNSNOOZE, sid, n)))
+            if (Build.VERSION.SDK_INT >= 24) b.setChronometerCountDown(true)
+            val nm = c.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+            nm.notify(noticeId(sid), b.build())
+        } catch (e: Exception) {
+            lastError = e.toString()
+        }
         try {
             Toast.makeText(c, "${min}분 후에 다시 울려요", Toast.LENGTH_SHORT).show()
         } catch (e: Exception) {
@@ -957,6 +1035,16 @@ class AlarmReceiver : BroadcastReceiver() {
                 AlarmKit.stopRing(context)
             }
             AlarmKit.A_STOP -> AlarmKit.stopRing(context)
+            AlarmKit.A_UNSNOOZE -> {
+                AlarmKit.cancelOne(context, id)
+                AlarmKit.remove(context, id)
+                val nm = context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+                nm.cancel(AlarmKit.noticeId(id))
+                try {
+                    Toast.makeText(context, "다시 울림을 취소했어요", Toast.LENGTH_SHORT).show()
+                } catch (e: Exception) {
+                }
+            }
             else -> AlarmKit.restore(context)
         }
     }
@@ -1000,7 +1088,10 @@ class AlarmService : Service() {
             wl = w
         } catch (e: Exception) {
         }
-        if (o.optBoolean("sound", true)) playSound(o.optString("tone", "bell"))
+        if (o.optBoolean("sound", true)) {
+            playSound(o.optString("tone", "bell"))
+            startRamp(o.optInt("ramp", 0))
+        }
         if (o.optBoolean("vibrate", true)) startVib()
         h.removeCallbacks(timeout)
         h.postDelayed(timeout, 5 * 60 * 1000L)
@@ -1014,6 +1105,34 @@ class AlarmService : Service() {
         } catch (e: Exception) {
         }
         return START_NOT_STICKY
+    }
+
+    private var rampRun: Runnable? = null
+
+    private fun startRamp(sec: Int) {
+        val mp = player ?: return
+        if (sec <= 0) return
+        try {
+            mp.setVolume(0.05f, 0.05f)
+        } catch (e: Exception) {
+            return
+        }
+        val t0 = System.currentTimeMillis()
+        val r = object : Runnable {
+            override fun run() {
+                val p = player ?: return
+                val f = ((System.currentTimeMillis() - t0) / (sec * 1000f)).coerceIn(0f, 1f)
+                val v = 0.05f + 0.95f * f * f
+                try {
+                    p.setVolume(v, v)
+                } catch (e: Exception) {
+                    return
+                }
+                if (f < 1f) h.postDelayed(this, 400)
+            }
+        }
+        rampRun = r
+        h.post(r)
     }
 
     private fun startPlayer(uri: Uri) {
@@ -1036,7 +1155,9 @@ class AlarmService : Service() {
         val resId = if (tone == "sys") 0 else resources.getIdentifier("alarm_$tone", "raw", packageName)
         val sys = RingtoneManager.getDefaultUri(RingtoneManager.TYPE_ALARM)
             ?: RingtoneManager.getDefaultUri(RingtoneManager.TYPE_RINGTONE)
-        val uri = if (resId != 0) Uri.parse("android.resource://$packageName/$resId") else sys
+        val custom = java.io.File(filesDir, "custom_alarm_sound")
+        val uri = if (tone == "custom" && custom.exists()) Uri.fromFile(custom)
+            else if (resId != 0) Uri.parse("android.resource://$packageName/$resId") else sys
         try {
             startPlayer(uri)
         } catch (e: Exception) {
@@ -1073,6 +1194,8 @@ class AlarmService : Service() {
     }
 
     private fun stopSound() {
+        rampRun?.let { h.removeCallbacks(it) }
+        rampRun = null
         try {
             player?.stop()
         } catch (e: Exception) {

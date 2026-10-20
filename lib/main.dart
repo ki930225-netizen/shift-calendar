@@ -10,6 +10,7 @@ import 'lunar.dart';
 import 'memo_page.dart';
 import 'models.dart';
 import 'settings_page.dart';
+import 'stats_page.dart';
 import 'store.dart';
 import 'week_page.dart';
 
@@ -507,6 +508,13 @@ class _CalendarPageState extends State<CalendarPage> {
           ),
         ]),
         actions: [
+          IconButton(
+            tooltip: '근무 통계',
+            visualDensity: VisualDensity.compact,
+            icon: const Icon(Icons.bar_chart),
+            onPressed: () => Navigator.of(context)
+                .push(MaterialPageRoute<void>(builder: (_) => StatsPage(month: _focused))),
+          ),
           IconButton(
             tooltip: '주별 패턴 (요일별 근무)',
             visualDensity: VisualDensity.compact,

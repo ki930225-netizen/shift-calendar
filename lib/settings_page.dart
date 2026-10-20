@@ -4,6 +4,7 @@ import 'package:intl/intl.dart';
 
 import 'models.dart';
 import 'native.dart';
+import 'stats_page.dart';
 import 'store.dart';
 import 'week_page.dart';
 
@@ -150,6 +151,15 @@ class _SettingsPageState extends State<SettingsPage> {
             trailing: const Icon(Icons.chevron_right),
             onTap: () => Navigator.of(context)
                 .push(MaterialPageRoute<void>(builder: (_) => const WeekPatternPage())),
+          ),
+          ListTile(
+            contentPadding: EdgeInsets.zero,
+            leading: const Icon(Icons.bar_chart),
+            title: const Text('근무 통계'),
+            subtitle: const Text('월별 근무 일수, 총 근무시간, 야간 횟수'),
+            trailing: const Icon(Icons.chevron_right),
+            onTap: () => Navigator.of(context)
+                .push(MaterialPageRoute<void>(builder: (_) => const StatsPage())),
           ),
           const Divider(height: 32),
           Text('폰 캘린더 연동', style: Theme.of(context).textTheme.titleMedium),

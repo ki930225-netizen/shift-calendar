@@ -168,6 +168,7 @@ const Map<String, String> kTones = {
   'melody': '멜로디',
   'soft': '차임',
   'sys': '폰 기본 알람음',
+  'custom': '내 음악 파일',
 };
 
 /// 근무별 알람: shiftId 근무인 날(요일 조건 포함), dayOffset 만큼 이동한 날 minutes(0~1439) 시각에 울림

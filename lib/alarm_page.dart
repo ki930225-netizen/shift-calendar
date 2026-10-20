@@ -286,6 +286,24 @@ class _AlarmPageState extends State<AlarmPage> {
               const Text('알람 전에 알림창에 "N분 뒤 알람"이 뜨고, 거기서 "이번 알람 끄기"를 누르면 그 회차만 꺼져요',
                   style: TextStyle(fontSize: 11, color: Colors.grey)),
               const SizedBox(height: 8),
+              Row(children: [
+                const Text('소리 점점 커지기', style: TextStyle(fontWeight: FontWeight.w600)),
+                const Spacer(),
+                DropdownButton<int>(
+                  value: const [0, 10, 20, 30, 60].contains(store.rampSec) ? store.rampSec : 20,
+                  items: const [0, 10, 20, 30, 60]
+                      .map((e) => DropdownMenuItem<int>(
+                          value: e, child: Text(e == 0 ? '끄기' : '$e초 동안')))
+                      .toList(),
+                  onChanged: (v) {
+                    store.rampSec = v ?? 20;
+                    store.save();
+                  },
+                ),
+              ]),
+              const Text('알람이 울리면 작은 소리에서 시작해 설정한 시간 동안 점점 커져요 (볼륨 슬라이더 크기까지)',
+                  style: TextStyle(fontSize: 11, color: Colors.grey)),
+              const SizedBox(height: 8),
               const Text('알람 볼륨', style: TextStyle(fontWeight: FontWeight.w600)),
               const AlarmVolumeSlider(),
               const SizedBox(height: 4),
@@ -524,6 +542,22 @@ class _AlarmEditPageState extends State<AlarmEditPage> {
   late Set<int> dows = Set<int>.of(widget.alarm?.days ?? const <int>[1, 2, 3, 4, 5, 6, 7]);
   late int offset = widget.alarm?.dayOffset ?? 0;
   late String tone = widget.alarm?.tone ?? 'bell';
+
+  /// 폰에서 소리 파일 고르기. 성공하면 true
+  Future<bool> _pickFile() async {
+    try {
+      final name = await pickAlarmSound();
+      if (name == null || name.isEmpty) return false;
+      store.customSoundName = name;
+      await store.save();
+      return true;
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('$e')));
+      }
+      return false;
+    }
+  }
   late bool sound = widget.alarm?.sound ?? true;
   late bool vibrate = widget.alarm?.vibrate ?? true;
   late final TextEditingController label = TextEditingController(text: widget.alarm?.label ?? '');
@@ -756,9 +790,36 @@ class _AlarmEditPageState extends State<AlarmEditPage> {
                     ChoiceChip(
                       label: Text(e.value),
                       selected: tone == e.key,
-                      onSelected: (_) => setState(() => tone = e.key),
+                      onSelected: (_) async {
+                        if (e.key == 'custom' && store.customSoundName.isEmpty) {
+                          if (!await _pickFile()) return;
+                        }
+                        setState(() => tone = e.key);
+                      },
                     ),
                 ]),
+              if (sound && tone == 'custom')
+                Padding(
+                  padding: const EdgeInsets.only(top: 4),
+                  child: Row(children: [
+                    const Icon(Icons.music_note, size: 18, color: Colors.blueGrey),
+                    const SizedBox(width: 6),
+                    Expanded(
+                      child: Text(
+                        store.customSoundName.isEmpty ? '고른 파일이 없어요' : store.customSoundName,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                      ),
+                    ),
+                    TextButton(
+                      onPressed: () async {
+                        await _pickFile();
+                        if (mounted) setState(() {});
+                      },
+                      child: const Text('파일 바꾸기'),
+                    ),
+                  ]),
+                ),
               SwitchListTile(
                 contentPadding: EdgeInsets.zero,
                 title: const Text('진동'),

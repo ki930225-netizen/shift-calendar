@@ -168,3 +168,13 @@ Future<bool> canFullScreen() async {
 }
 
 Future<void> openFullScreenSettings() => _call('openFullScreenSettings');
+
+/// 폰 안의 음악/소리 파일을 골라 앱 안에 복사해 둔다. 반환: 파일 이름 (취소하면 null)
+Future<String?> pickAlarmSound() async {
+  if (kIsWeb) return null;
+  try {
+    return await _ch.invokeMethod<String>('pickAlarmSound');
+  } catch (e) {
+    throw Exception('파일 선택 실패: $e');
+  }
+}

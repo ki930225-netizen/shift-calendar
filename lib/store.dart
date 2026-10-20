@@ -4,6 +4,7 @@ import 'dart:typed_data';
 import 'dart:ui' show DartPluginRegistrant;
 
 import 'package:flutter/foundation.dart';
+import 'package:flutter/material.dart' show DateUtils;
 import 'package:flutter_local_notifications/flutter_local_notifications.dart';
 import 'package:intl/intl.dart';
 import 'package:shared_preferences/shared_preferences.dart';
@@ -42,7 +43,8 @@ class _Pending {
 }
 
 /// 알람 채널: 소리/진동 조합마다 채널이 따로 필요하다 (안드로이드 규칙)
-AndroidNotificationDetails buildAlarmDetails(String tone, bool sound, bool vibrate) {
+AndroidNotificationDetails buildAlarmDetails(String tone0, bool sound, bool vibrate) {
+  final tone = tone0 == 'custom' ? 'sys' : tone0; // 예비(일반 알림) 방식에서는 내 음악 파일 대신 폰 기본 알람음
   final toneName = kTones[tone] ?? '벨';
   AndroidNotificationSound? snd;
   if (sound) {
@@ -221,6 +223,9 @@ class Store extends ChangeNotifier {
   bool weekRestHol = true;
 
   int preNoticeMin = 20; // 알람 몇 분 전에 알림창에 미리 알려줄지 (0 = 끔)
+  int rampSec = 20; // 알람 소리가 점점 커지는 시간(초). 0 = 처음부터 큰 소리
+  String customSoundName = ''; // "내 음악 파일"로 고른 파일 이름
+  Map<String, List<int>> shiftTimes = {}; // 근무 id -> [시작분, 종료분] (통계의 근무시간 계산용)
   String schedNote = ''; // 마지막 알람 등록 결과
   int schedVersion = 0;
 
@@ -390,6 +395,9 @@ class Store extends ChangeNotifier {
         'holidaySync': holidaySync,
         'icalUrl': icalUrl,
         'preNotice': preNoticeMin,
+        'rampSec': rampSec,
+        'customSound': customSoundName,
+        'shiftTimes': shiftTimes,
         'skipped': skippedKeys.toList(),
       };
 
@@ -439,6 +447,13 @@ class Store extends ChangeNotifier {
       holidaySync = (m['holidaySync'] as bool?) ?? true;
       icalUrl = (m['icalUrl'] as String?) ?? '';
       preNoticeMin = (m['preNotice'] as num?)?.toInt() ?? 20;
+      rampSec = (m['rampSec'] as num?)?.toInt() ?? 20;
+      customSoundName = (m['customSound'] as String?) ?? '';
+      final st = <String, List<int>>{};
+      ((m['shiftTimes'] as Map?) ?? {}).forEach((k, v) {
+        if (v is List && v.length >= 2) st['$k'] = [(v[0] as num).toInt(), (v[1] as num).toInt()];
+      });
+      shiftTimes = st;
       return true;
     } catch (e) {
       loadNote = '$loadNote 데이터 해석 실패($e)';
@@ -951,6 +966,41 @@ class Store extends ChangeNotifier {
     return s.length > 40 ? '${s.substring(0, 40)}…' : s;
   }
 
+  // ── 근무 통계 ──
+
+  /// 근무 하나의 근무시간(분). 시간이 설정돼 있지 않으면 null. 종료가 시작보다 이르면 다음날로 계산.
+  int? shiftMinutes(String id) {
+    final t = shiftTimes[id];
+    if (t == null) return null;
+    var d = t[1] - t[0];
+    if (d <= 0) d += 1440;
+    return d;
+  }
+
+  /// 한 달 통계: 근무별 일수, 총 근무시간(분), 근태 일수
+  ({Map<String, int> counts, int workMinutes, int nightDays, Map<String, int> attendCounts, int emptyDays})
+      monthStats(DateTime month) {
+    final counts = <String, int>{};
+    final att = <String, int>{};
+    int mins = 0, night = 0, empty = 0;
+    final n = DateUtils.getDaysInMonth(month.year, month.month);
+    for (int i = 1; i <= n; i++) {
+      final d = DateTime(month.year, month.month, i);
+      final sid = days[dayKey(d)];
+      if (sid == null) {
+        empty++;
+      } else {
+        counts[sid] = (counts[sid] ?? 0) + 1;
+        mins += shiftMinutes(sid) ?? 0;
+        final t = shiftTimes[sid];
+        if (t != null && (t[1] <= t[0] || t[0] >= 20 * 60 || t[0] < 5 * 60)) night++;
+      }
+      final a = attend[dayKey(d)];
+      if (a != null) att[a] = (att[a] ?? 0) + 1;
+    }
+    return (counts: counts, workMinutes: mins, nightDays: night, attendCounts: att, emptyDays: empty);
+  }
+
   // ── 알람 등록 ──
 
   String lastSchedError = '';
@@ -1143,6 +1193,7 @@ class Store extends ChangeNotifier {
         'noticeAt': noticeAt,
         'noticeTitle': nTitle,
         'noticeBody': nBody,
+        'ramp': rampSec,
       });
     }
 
@@ -1314,6 +1365,7 @@ class Store extends ChangeNotifier {
       'vibrate': vibrate,
       'key': 'T|9002|0',
       'noticeAt': 0,
+      'ramp': rampSec,
     };
     String nativeErr = '';
     try {
