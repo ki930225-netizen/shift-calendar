@@ -1,4 +1,5 @@
 import 'dart:convert';
+import 'dart:typed_data';
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter_local_notifications/flutter_local_notifications.dart';
@@ -7,8 +8,8 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'package:timezone/data/latest_all.dart' as tzdata;
 import 'package:timezone/timezone.dart' as tz;
 
+import 'holidays.dart';
 import 'ical.dart';
-import 'lunar.dart';
 import 'models.dart';
 
 final FlutterLocalNotificationsPlugin notif = FlutterLocalNotificationsPlugin();
@@ -18,7 +19,18 @@ class _Pending {
   final String title;
   final String body;
   final bool alarmType;
-  _Pending(this.when, this.title, this.body, this.alarmType);
+  final String tone;
+  final bool sound;
+  final bool vibrate;
+  _Pending(this.when, this.title, this.body, this.alarmType,
+      {this.tone = 'bell', this.sound = true, this.vibrate = true});
+}
+
+class AlarmStatus {
+  final bool notifOk;
+  final bool exactOk;
+  final int pending;
+  AlarmStatus(this.notifOk, this.exactOk, this.pending);
 }
 
 List<T> _decodeList<T>(String? s, T Function(Map<String, dynamic>) f) {
@@ -67,7 +79,15 @@ class Store extends ChangeNotifier {
     for (final e in evByDay[k] ?? const <Ev>[]) {
       if (e.kind == 0) return e.title;
     }
-    return builtinHolidays(d.year)[k] ?? lunarHolidays(d.year)[k];
+    return allBuiltinHolidays(d.year)[k];
+  }
+
+  /// 쉬는 날인지 (토요일 / 일요일 / 공휴일 중 고른 것)
+  bool isRestDay(DateTime d, {bool sat = true, bool sun = true, bool hol = true}) {
+    if (sat && d.weekday == DateTime.saturday) return true;
+    if (sun && d.weekday == DateTime.sunday) return true;
+    if (hol && holidayName(d) != null) return true;
+    return false;
   }
 
   /// 공휴일이 아닌 외부 일정(기념일 포함)
@@ -90,22 +110,31 @@ class Store extends ChangeNotifier {
     return l;
   }
 
-  /// 앞으로 가장 먼저 울릴 근무 알람
-  NextAlarm? nextAlarm() {
-    final now = DateTime.now();
-    NextAlarm? best;
-    for (int i = 0; i < 60; i++) {
+  /// 앞으로 horizon 일 안에 울릴 근무 알람을 시각 순서로 계산 (요일 조건·전날/다음날 반영)
+  List<NextAlarm> planShiftAlarms(DateTime now, int horizon) {
+    final out = <NextAlarm>[];
+    final limit = now.add(Duration(days: horizon));
+    for (int i = -1; i <= horizon + 1; i++) {
       final d = DateTime(now.year, now.month, now.day + i);
       final sid = days[dayKey(d)];
       if (sid == null) continue;
       for (final a in alarms) {
         if (!a.enabled || a.shiftId != sid) continue;
-        final w = DateTime(d.year, d.month, d.day, a.minutes ~/ 60, a.minutes % 60);
-        if (w.isBefore(now)) continue;
-        if (best == null || w.isBefore(best.when)) best = NextAlarm(w, a);
+        if (!a.days.contains(d.weekday)) continue;
+        final ad = DateTime(d.year, d.month, d.day + a.dayOffset);
+        final w = DateTime(ad.year, ad.month, ad.day, a.minutes ~/ 60, a.minutes % 60);
+        if (w.isBefore(now) || w.isAfter(limit)) continue;
+        out.add(NextAlarm(w, a));
       }
     }
-    return best;
+    out.sort((x, y) => x.when.compareTo(y.when));
+    return out;
+  }
+
+  /// 앞으로 가장 먼저 울릴 근무 알람
+  NextAlarm? nextAlarm() {
+    final l = planShiftAlarms(DateTime.now(), 60);
+    return l.isEmpty ? null : l.first;
   }
 
   void _rebuildEv() {
@@ -172,12 +201,22 @@ class Store extends ChangeNotifier {
     save(resched: false);
   }
 
-  void applyPattern(DateTime start, int count, List<String> seq) {
-    if (seq.isEmpty) return;
-    pattern = seq;
+  /// 패턴 일괄 적용.
+  /// 쉬는 날(토/일/공휴일 중 고른 것)은 '휴'로 채우고, 패턴 순서는 쉬는 날을 건너뛰어
+  /// 나머지 날(평일)에만 이어서 적용된다.
+  void applyPattern(DateTime start, int count, List<String> seq,
+      {bool restSat = false, bool restSun = false, bool restHol = false}) {
+    final useRest = restSat || restSun || restHol;
+    if (seq.isNotEmpty) pattern = seq;
+    int idx = 0;
     for (int i = 0; i < count; i++) {
       final d = DateTime(start.year, start.month, start.day + i);
-      days[dayKey(d)] = seq[i % seq.length];
+      if (useRest && isRestDay(d, sat: restSat, sun: restSun, hol: restHol)) {
+        days[dayKey(d)] = 'OFF';
+      } else if (seq.isNotEmpty) {
+        days[dayKey(d)] = seq[idx % seq.length];
+        idx++;
+      }
     }
     save();
   }
@@ -351,17 +390,14 @@ class Store extends ChangeNotifier {
     final pend = <_Pending>[];
 
     // 1) 근무별 알람: 앞으로 60일
-    for (int i = 0; i < 60; i++) {
-      final d = DateTime(now.year, now.month, now.day + i);
-      final sid = days[dayKey(d)];
-      final shift = shiftById(sid);
+    for (final na in planShiftAlarms(now, 60)) {
+      final a = na.alarm;
+      final shift = shiftById(a.shiftId);
       if (shift == null) continue;
-      for (final a in alarms) {
-        if (!a.enabled || a.shiftId != sid) continue;
-        final when = DateTime(d.year, d.month, d.day, a.minutes ~/ 60, a.minutes % 60);
-        if (when.isBefore(now)) continue;
-        pend.add(_Pending(when, '${shift.label} 근무 알람', '${fmtHM(a.minutes)} 알람', true));
-      }
+      final String day = a.dayOffset < 0 ? '내일' : (a.dayOffset > 0 ? '어제' : '오늘');
+      final body = a.label.isNotEmpty ? a.label : '$day ${shift.label} 근무 · ${fmtHM(a.minutes)}';
+      pend.add(_Pending(na.when, '${shift.label} 근무 알람', body, true,
+          tone: a.tone, sound: a.sound, vibrate: a.vibrate));
     }
 
     // 2) 메모 알림: 앞으로 120일
@@ -384,39 +420,126 @@ class Store extends ChangeNotifier {
     }
   }
 
-  Future<void> _scheduleOne(int id, _Pending p) async {
-    final when = tz.TZDateTime.from(p.when, tz.local);
-    final details = NotificationDetails(
-      android: p.alarmType
-          ? const AndroidNotificationDetails(
-              'shift_alarm',
-              '근무 알람',
-              channelDescription: '근무 시간 알람',
-              importance: Importance.max,
-              priority: Priority.max,
-              category: AndroidNotificationCategory.alarm,
-              audioAttributesUsage: AudioAttributesUsage.alarm,
-              fullScreenIntent: true,
-              playSound: true,
-              enableVibration: true,
-            )
-          : const AndroidNotificationDetails(
-              'memo_alarm',
-              '메모 알림',
-              channelDescription: '메모 알림',
-              importance: Importance.high,
-              priority: Priority.high,
-            ),
+  /// 알람 채널: 소리/진동 조합마다 채널이 따로 필요하다 (안드로이드 규칙)
+  AndroidNotificationDetails _alarmDetails(String tone, bool sound, bool vibrate) {
+    final toneName = kTones[tone] ?? '벨';
+    AndroidNotificationSound? snd;
+    if (sound) {
+      snd = tone == 'sys'
+          ? const UriAndroidNotificationSound('content://settings/system/alarm_alert')
+          : RawResourceAndroidNotificationSound('alarm_$tone');
+    }
+    final chId = 'alarm2_${sound ? tone : 'mute'}_${vibrate ? 'v' : 'n'}';
+    final chName = '근무 알람 · ${sound ? toneName : '무음'}${vibrate ? ' · 진동' : ''}';
+    return AndroidNotificationDetails(
+      chId,
+      chName,
+      channelDescription: '근무 시간 알람',
+      importance: Importance.max,
+      priority: Priority.max,
+      category: AndroidNotificationCategory.alarm,
+      audioAttributesUsage: AudioAttributesUsage.alarm,
+      fullScreenIntent: true,
+      visibility: NotificationVisibility.public,
+      playSound: sound,
+      sound: snd,
+      enableVibration: vibrate,
+      vibrationPattern:
+          vibrate ? Int64List.fromList(<int>[0, 800, 500, 800, 500, 800, 500, 800]) : null,
+      additionalFlags: sound ? Int32List.fromList(<int>[4]) : null, // 4 = 끌 때까지 소리 반복
+      timeoutAfter: 180000, // 3분 뒤 자동으로 사라짐
     );
+  }
+
+  NotificationDetails _detailsFor(_Pending p) {
+    if (p.alarmType) {
+      return NotificationDetails(android: _alarmDetails(p.tone, p.sound, p.vibrate));
+    }
+    return const NotificationDetails(
+      android: AndroidNotificationDetails(
+        'memo_alarm',
+        '메모 알림',
+        channelDescription: '메모 알림',
+        importance: Importance.high,
+        priority: Priority.high,
+      ),
+    );
+  }
+
+  /// 반환: 'exact' (정확한 시각) / 'inexact' (정확한 알람 권한 없음, 몇 분 늦을 수 있음) / 'fail'
+  Future<String> _scheduleOne(int id, _Pending p) async {
+    final when = tz.TZDateTime.from(p.when, tz.local);
+    final details = _detailsFor(p);
     Future<void> schedule(AndroidScheduleMode mode) =>
         notif.zonedSchedule(id, p.title, p.body, when, details, androidScheduleMode: mode);
     try {
       await schedule(AndroidScheduleMode.exactAllowWhileIdle);
+      return 'exact';
     } catch (_) {
       // 정확한 알람 권한이 없으면 덜 정확한 방식으로라도 등록
       try {
         await schedule(AndroidScheduleMode.inexactAllowWhileIdle);
-      } catch (_) {}
+        return 'inexact';
+      } catch (e) {
+        debugPrint('알람 예약 실패: $e');
+        return 'fail';
+      }
+    }
+  }
+
+  /// 알람 테스트. now=true 면 바로 울리고, 아니면 10초 뒤에 울린다.
+  Future<String> testAlarm({
+    required bool now,
+    String tone = 'bell',
+    bool sound = true,
+    bool vibrate = true,
+  }) async {
+    if (kIsWeb) return 'PC 미리보기에서는 알람을 테스트할 수 없어요';
+    try {
+      final p = _Pending(
+        DateTime.now().add(const Duration(seconds: 10)),
+        '테스트 알람',
+        '이 알람이 들리면 정상입니다',
+        true,
+        tone: tone,
+        sound: sound,
+        vibrate: vibrate,
+      );
+      if (now) {
+        await notif.show(9001, p.title, p.body, _detailsFor(p));
+        return '알림을 보냈어요. 소리가 안 나면 아래 점검 항목을 확인하세요';
+      }
+      final r = await _scheduleOne(9002, p);
+      if (r == 'exact') return '10초 뒤에 울려요. 화면을 꺼 두고 기다려 보세요';
+      if (r == 'inexact') return '예약은 됐지만 "정확한 알람" 권한이 없어 시간이 늦을 수 있어요';
+      return '알람 예약에 실패했어요. 알림 권한을 확인하세요';
+    } catch (e) {
+      return '테스트 실패: $e';
+    }
+  }
+
+  /// 알림 + 정확한 알람 권한 요청 (알람 탭의 "허용하기" 버튼)
+  Future<void> requestExact() async {
+    if (kIsWeb) return;
+    try {
+      final a =
+          notif.resolvePlatformSpecificImplementation<AndroidFlutterLocalNotificationsPlugin>();
+      await a?.requestNotificationsPermission();
+      await a?.requestExactAlarmsPermission();
+    } catch (_) {}
+  }
+
+  Future<AlarmStatus> alarmStatus() async {
+    if (kIsWeb) return AlarmStatus(false, false, 0);
+    try {
+      final a =
+          notif.resolvePlatformSpecificImplementation<AndroidFlutterLocalNotificationsPlugin>();
+      final n = await a?.areNotificationsEnabled() ?? false;
+      final e = await a?.canScheduleExactNotifications() ?? false;
+      final p = (await notif.pendingNotificationRequests()).length;
+      return AlarmStatus(n, e, p);
+    } catch (_) {
+      return AlarmStatus(false, false, 0);
     }
   }
 }
@@ -434,6 +557,17 @@ Future<void> initNotifications() async {
   );
   final a =
       notif.resolvePlatformSpecificImplementation<AndroidFlutterLocalNotificationsPlugin>();
+  try {
+    await a?.deleteNotificationChannel('shift_alarm'); // 예전 버전 채널 정리
+  } catch (_) {}
   await a?.requestNotificationsPermission();
-  await a?.requestExactAlarmsPermission();
+  // 정확한 알람 권한 설정창은 처음 한 번만 자동으로 띄운다 (이후에는 알람 탭에서 직접)
+  try {
+    final p = await SharedPreferences.getInstance();
+    final ok = await a?.canScheduleExactNotifications() ?? true;
+    if (!ok && !(p.getBool('askedExact') ?? false)) {
+      await p.setBool('askedExact', true);
+      await a?.requestExactAlarmsPermission();
+    }
+  } catch (_) {}
 }

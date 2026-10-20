@@ -7,8 +7,11 @@
   3) 알람에 필요한 권한/설정을 자동으로 패치하고
   4) flutter pub get 까지 실행합니다.
 """
+import math
 import re
 import shutil
+import struct
+import wave
 import subprocess
 import sys
 from pathlib import Path
@@ -142,6 +145,150 @@ elif gradle_groovy.exists():
     gradle_groovy.write_text(g, encoding="utf-8")
 else:
     print("경고: android/app/build.gradle(.kts) 를 찾지 못했습니다. README의 수동 설정을 따라주세요.")
+
+
+# 3-c) 알람음(벨/삐삐/멜로디/차임)을 직접 만들어 안드로이드 raw 리소스로 넣는다 (별도 파일 업로드 불필요)
+def _write_wav(path, samples, rate=22050):
+    peak = max(1e-9, max(abs(x) for x in samples))
+    scale = 0.9 * 32767 / peak
+    with wave.open(str(path), "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(rate)
+        w.writeframes(b"".join(struct.pack("<h", int(x * scale)) for x in samples))
+
+
+def _note(freq, dur, rate=22050, harm=((1, 1.0), (2, 0.35), (3, 0.15)), decay=6.0, attack=0.004):
+    n = int(rate * dur)
+    out = []
+    for i in range(n):
+        t = i / rate
+        env = (1 - math.exp(-t / attack)) * math.exp(-decay * t)
+        v = sum(a * math.sin(2 * math.pi * freq * h * t) for h, a in harm)
+        out.append(v * env)
+    return out
+
+
+def _silence(dur, rate=22050):
+    return [0.0] * int(rate * dur)
+
+
+def _mix(parts):
+    out = []
+    for p in parts:
+        out.extend(p)
+    return out
+
+
+def make_tones(raw_dir):
+    raw_dir.mkdir(parents=True, exist_ok=True)
+    # 벨: 높은 종소리 3번
+    bell = []
+    for _ in range(3):
+        bell += _note(988, 0.55, harm=((1, 1.0), (2.76, 0.5), (5.4, 0.25)), decay=4.5)
+    bell += _silence(0.7)
+    _write_wav(raw_dir / "alarm_bell.wav", bell)
+    # 삐삐삐: 디지털 알람
+    beep = []
+    for _ in range(4):
+        beep += _note(1400, 0.12, harm=((1, 1.0), (3, 0.3)), decay=0.5)
+        beep += _silence(0.1)
+    beep += _silence(0.6)
+    _write_wav(raw_dir / "alarm_beep.wav", beep)
+    # 멜로디: 도 미 솔 높은도
+    mel = []
+    for f in (523, 659, 784, 1047, 784, 659):
+        mel += _note(f, 0.24, harm=((1, 1.0), (2, 0.25)), decay=3.0)
+    mel += _silence(0.7)
+    _write_wav(raw_dir / "alarm_melody.wav", mel)
+    # 차임: 부드러운 두 음
+    soft = _note(660, 0.9, harm=((1, 1.0), (2, 0.2)), decay=2.5)
+    soft += _note(880, 1.1, harm=((1, 1.0), (2, 0.2)), decay=2.5)
+    soft += _silence(1.0)
+    _write_wav(raw_dir / "alarm_soft.wav", soft)
+    # 안드로이드가 쓰지 않는 리소스로 알고 지우지 않도록 보호
+    (raw_dir / "keep.xml").write_text(
+        '<?xml version="1.0" encoding="utf-8"?>\n'
+        '<resources xmlns:tools="http://schemas.android.com/tools"\n'
+        '    tools:keep="@raw/alarm_*" />\n',
+        encoding="utf-8",
+    )
+
+
+make_tones(APP / "android/app/src/main/res/raw")
+
+# 3-d) MainActivity: 알람 볼륨 조절 / 설정 화면 열기 기능
+KOTLIN = """package PKGNAME
+
+import android.content.Context
+import android.content.Intent
+import android.media.AudioManager
+import android.net.Uri
+import android.provider.Settings
+import io.flutter.embedding.android.FlutterActivity
+import io.flutter.embedding.engine.FlutterEngine
+import io.flutter.plugin.common.MethodChannel
+
+class MainActivity : FlutterActivity() {
+    override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
+        super.configureFlutterEngine(flutterEngine)
+        MethodChannel(flutterEngine.dartExecutor.binaryMessenger, "shiftcal/native")
+            .setMethodCallHandler { call, result ->
+                try {
+                    when (call.method) {
+                        "getAlarmVolume" -> {
+                            val am = getSystemService(Context.AUDIO_SERVICE) as AudioManager
+                            result.success(
+                                listOf(
+                                    am.getStreamVolume(AudioManager.STREAM_ALARM),
+                                    am.getStreamMaxVolume(AudioManager.STREAM_ALARM)
+                                )
+                            )
+                        }
+                        "setAlarmVolume" -> {
+                            val am = getSystemService(Context.AUDIO_SERVICE) as AudioManager
+                            val v = call.argument<Int>("v") ?: 0
+                            am.setStreamVolume(AudioManager.STREAM_ALARM, v, 0)
+                            result.success(true)
+                        }
+                        "openAppSettings" -> {
+                            val i = Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS)
+                            i.data = Uri.parse("package:" + packageName)
+                            startActivity(i)
+                            result.success(true)
+                        }
+                        "openBatterySettings" -> {
+                            startActivity(Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS))
+                            result.success(true)
+                        }
+                        "openNotificationSettings" -> {
+                            val i = Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS)
+                            i.putExtra(Settings.EXTRA_APP_PACKAGE, packageName)
+                            startActivity(i)
+                            result.success(true)
+                        }
+                        else -> result.notImplemented()
+                    }
+                } catch (e: Exception) {
+                    result.error("native", e.message, null)
+                }
+            }
+    }
+}
+"""
+
+src_root = APP / "android/app/src/main"
+acts = list(src_root.glob("**/MainActivity.kt")) + list(src_root.glob("**/MainActivity.java"))
+if acts:
+    act = acts[0]
+    old = act.read_text(encoding="utf-8")
+    m = re.search(r"package\s+([\w.]+)", old)
+    pkg = m.group(1) if m else "com.myshift.shift_calendar"
+    for other in acts:
+        other.unlink()
+    (act.parent / "MainActivity.kt").write_text(KOTLIN.replace("PKGNAME", pkg), encoding="utf-8")
+else:
+    print("경고: MainActivity 를 찾지 못했습니다. 알람 볼륨 슬라이더가 동작하지 않을 수 있습니다.")
 
 # 4) 패키지 설치
 run(["flutter", "pub", "get"], cwd=APP)

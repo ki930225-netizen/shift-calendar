@@ -161,23 +161,65 @@ class Memo {
       );
 }
 
-/// 근무별 알람: shiftId 근무인 날, 그날 minutes(0~1439) 시각에 울림
+/// 알람음 선택지 (id → 이름). 'sys' 는 폰에 설정된 기본 알람음.
+const Map<String, String> kTones = {
+  'bell': '벨',
+  'beep': '삐삐삐',
+  'melody': '멜로디',
+  'soft': '차임',
+  'sys': '폰 기본 알람음',
+};
+
+/// 근무별 알람: shiftId 근무인 날(요일 조건 포함), dayOffset 만큼 이동한 날 minutes(0~1439) 시각에 울림
 class AlarmItem {
   int id;
   int minutes;
   String shiftId;
   bool enabled;
+  List<int> days; // 근무 날짜의 요일 조건 (1=월 ... 7=일)
+  int dayOffset; // -1 전날, 0 당일, 1 다음날
+  String tone;
+  bool sound;
+  bool vibrate;
+  String label;
 
-  AlarmItem({required this.id, required this.minutes, required this.shiftId, this.enabled = true});
+  AlarmItem({
+    required this.id,
+    required this.minutes,
+    required this.shiftId,
+    this.enabled = true,
+    List<int>? days,
+    this.dayOffset = 0,
+    this.tone = 'bell',
+    this.sound = true,
+    this.vibrate = true,
+    this.label = '',
+  }) : days = days ?? <int>[1, 2, 3, 4, 5, 6, 7];
 
-  Map<String, dynamic> toJson() =>
-      {'id': id, 'minutes': minutes, 'shiftId': shiftId, 'enabled': enabled};
+  Map<String, dynamic> toJson() => {
+        'id': id,
+        'minutes': minutes,
+        'shiftId': shiftId,
+        'enabled': enabled,
+        'days': days,
+        'dayOffset': dayOffset,
+        'tone': tone,
+        'sound': sound,
+        'vibrate': vibrate,
+        'label': label,
+      };
 
   factory AlarmItem.fromJson(Map<String, dynamic> j) => AlarmItem(
         id: j['id'],
         minutes: j['minutes'],
         shiftId: j['shiftId'],
         enabled: j['enabled'] ?? true,
+        days: (j['days'] as List?)?.map((e) => e as int).toList(),
+        dayOffset: j['dayOffset'] ?? 0,
+        tone: j['tone'] ?? 'bell',
+        sound: j['sound'] ?? true,
+        vibrate: j['vibrate'] ?? true,
+        label: j['label'] ?? '',
       );
 }
 

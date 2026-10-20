@@ -286,8 +286,9 @@ class _CalendarPageState extends State<CalendarPage> {
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.stretch,
                 children: [
-                  Padding(
-                    padding: const EdgeInsets.fromLTRB(3, 2, 3, 0),
+                  Container(
+                    color: hol != null ? const Color(0xFFFFD3D9) : null, // 공휴일: 빨간 띠지
+                    padding: const EdgeInsets.fromLTRB(3, 2, 3, 1),
                     child: Row(children: [
                       Container(
                         constraints: const BoxConstraints(minWidth: 16),
@@ -434,6 +435,18 @@ class _CalendarPageState extends State<CalendarPage> {
           ),
         ]),
         actions: [
+          IconButton(
+            tooltip: '쉬는 날(토·일·공휴일) 휴로 입력',
+            icon: const Icon(Icons.event_busy),
+            onPressed: () => showDialog<void>(
+              context: context,
+              builder: (_) => PatternDialog(
+                restOnly: true,
+                start: DateTime(_focused.year, _focused.month, 1),
+                count: DateUtils.getDaysInMonth(_focused.year, _focused.month),
+              ),
+            ),
+          ),
           IconButton(
             tooltip: '근무 연속 입력',
             icon: Icon(Icons.edit_calendar, color: _brushMode ? cs.primary : null),

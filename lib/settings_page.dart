@@ -73,9 +73,20 @@ class _SettingsPageState extends State<SettingsPage> {
             contentPadding: EdgeInsets.zero,
             leading: const Icon(Icons.auto_fix_high),
             title: const Text('교대 패턴 일괄 적용'),
-            subtitle: const Text('예) D → D → N → N → 휴 → 휴 반복 입력'),
+            subtitle: const Text('예) D → D → N → N → 휴 → 휴 반복 입력\n'
+                '토·일·공휴일은 휴로 두고 나머지 날에만 패턴을 이어갈 수도 있어요'),
+            isThreeLine: true,
             trailing: const Icon(Icons.chevron_right),
             onTap: () => showDialog(context: context, builder: (_) => const PatternDialog()),
+          ),
+          ListTile(
+            contentPadding: EdgeInsets.zero,
+            leading: const Icon(Icons.event_busy),
+            title: const Text('쉬는 날(토·일·공휴일) 휴로 일괄 입력'),
+            subtitle: const Text('기간을 정하면 토요일·일요일·공휴일을 한 번에 "휴"로 채웁니다'),
+            trailing: const Icon(Icons.chevron_right),
+            onTap: () => showDialog(
+                context: context, builder: (_) => const PatternDialog(restOnly: true)),
           ),
           const Divider(height: 32),
           Text('공휴일', style: Theme.of(context).textTheme.titleMedium),
@@ -176,56 +187,97 @@ class _SettingsPageState extends State<SettingsPage> {
 // ───────────────────────── 패턴 일괄 적용 ─────────────────────────
 
 class PatternDialog extends StatefulWidget {
-  const PatternDialog({super.key});
+  final bool restOnly; // true: 패턴 없이 쉬는 날만 휴로 채우기
+  final DateTime? start;
+  final int? count;
+  const PatternDialog({super.key, this.restOnly = false, this.start, this.count});
 
   @override
   State<PatternDialog> createState() => _PatternDialogState();
 }
 
 class _PatternDialogState extends State<PatternDialog> {
-  DateTime start = DateTime.now();
-  int count = 90;
-  late List<String> seq = List.of(store.pattern);
+  late DateTime start = widget.start ?? DateTime.now();
+  late int count = widget.count ?? 90;
+  late List<String> seq = widget.restOnly ? <String>[] : List<String>.of(store.pattern);
+  late bool useRest = widget.restOnly;
+  bool restSat = true;
+  bool restSun = true;
+  bool restHol = true;
+
+  bool get _canApply => seq.isNotEmpty || (useRest && (restSat || restSun || restHol));
 
   @override
   Widget build(BuildContext context) {
+    final opts = <int>{30, 60, 90, 180, 365, count}.toList()..sort();
     return AlertDialog(
-      title: const Text('교대 패턴 일괄 적용'),
+      title: Text(widget.restOnly ? '쉬는 날 휴로 일괄 입력' : '교대 패턴 일괄 적용'),
       content: SingleChildScrollView(
         child: Column(
           mainAxisSize: MainAxisSize.min,
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            const Text('아래 근무를 눌러 반복할 순서를 만드세요.\n예) D → D → N → N → 휴 → 휴'),
-            const SizedBox(height: 12),
-            Wrap(spacing: 6, runSpacing: 6, children: [
-              for (int i = 0; i < seq.length; i++)
-                GestureDetector(
-                  onTap: () => setState(() => seq.removeAt(i)),
-                  child: Stack(clipBehavior: Clip.none, children: [
-                    Padding(
-                      padding: const EdgeInsets.all(4),
-                      child: ShiftBadge(shiftById(seq[i]) ?? kShifts.first, size: 30),
-                    ),
-                    const Positioned(
-                      right: 0,
-                      top: 0,
-                      child: Icon(Icons.cancel, size: 14, color: Colors.grey),
-                    ),
-                  ]),
+            if (!widget.restOnly) ...[
+              const Text('아래 근무를 눌러 반복할 순서를 만드세요.\n예) D → D → N → N → 휴 → 휴'),
+              const SizedBox(height: 12),
+              Wrap(spacing: 6, runSpacing: 6, children: [
+                for (int i = 0; i < seq.length; i++)
+                  GestureDetector(
+                    onTap: () => setState(() => seq.removeAt(i)),
+                    child: Stack(clipBehavior: Clip.none, children: [
+                      Padding(
+                        padding: const EdgeInsets.all(4),
+                        child: ShiftBadge(shiftById(seq[i]) ?? kShifts.first, size: 30),
+                      ),
+                      const Positioned(
+                        right: 0,
+                        top: 0,
+                        child: Icon(Icons.cancel, size: 14, color: Colors.grey),
+                      ),
+                    ]),
+                  ),
+                if (seq.isEmpty) const Text('(비어 있음)', style: TextStyle(color: Colors.grey)),
+              ]),
+              const SizedBox(height: 8),
+              const Text('추가', style: TextStyle(color: Colors.grey, fontSize: 12)),
+              const SizedBox(height: 4),
+              Wrap(spacing: 8, runSpacing: 8, children: [
+                for (final s in kShifts)
+                  GestureDetector(
+                    onTap: () => setState(() => seq.add(s.id)),
+                    child: ShiftBadge(s, size: 32),
+                  ),
+              ]),
+              const Divider(height: 24),
+              SwitchListTile(
+                contentPadding: EdgeInsets.zero,
+                title: const Text('쉬는 날은 "휴"로, 나머지 날에만 패턴 이어가기'),
+                subtitle: const Text('패턴 순서는 쉬는 날을 건너뛰고 평일에만 이어집니다'),
+                value: useRest,
+                onChanged: (v) => setState(() => useRest = v),
+              ),
+            ],
+            if (useRest) ...[
+              const Text('쉬는 날로 칠 날', style: TextStyle(color: Colors.grey, fontSize: 12)),
+              const SizedBox(height: 4),
+              Wrap(spacing: 8, children: [
+                FilterChip(
+                  label: const Text('토요일'),
+                  selected: restSat,
+                  onSelected: (v) => setState(() => restSat = v),
                 ),
-              if (seq.isEmpty) const Text('(비어 있음)', style: TextStyle(color: Colors.grey)),
-            ]),
-            const SizedBox(height: 8),
-            const Text('추가', style: TextStyle(color: Colors.grey, fontSize: 12)),
-            const SizedBox(height: 4),
-            Wrap(spacing: 8, runSpacing: 8, children: [
-              for (final s in kShifts)
-                GestureDetector(
-                  onTap: () => setState(() => seq.add(s.id)),
-                  child: ShiftBadge(s, size: 32),
+                FilterChip(
+                  label: const Text('일요일'),
+                  selected: restSun,
+                  onSelected: (v) => setState(() => restSun = v),
                 ),
-            ]),
+                FilterChip(
+                  label: const Text('공휴일'),
+                  selected: restHol,
+                  onSelected: (v) => setState(() => restHol = v),
+                ),
+              ]),
+            ],
             const Divider(height: 24),
             ListTile(
               contentPadding: EdgeInsets.zero,
@@ -246,10 +298,10 @@ class _PatternDialogState extends State<PatternDialog> {
               const Spacer(),
               DropdownButton<int>(
                 value: count,
-                items: [30, 60, 90, 180, 365]
-                    .map((e) => DropdownMenuItem(value: e, child: Text('$e일')))
+                items: opts
+                    .map((e) => DropdownMenuItem<int>(value: e, child: Text('$e일')))
                     .toList(),
-                onChanged: (v) => setState(() => count = v!),
+                onChanged: (v) => setState(() => count = v ?? count),
               ),
             ]),
             const Text('※ 해당 기간의 기존 근무는 덮어씌워집니다.',
@@ -260,10 +312,17 @@ class _PatternDialogState extends State<PatternDialog> {
       actions: [
         TextButton(onPressed: () => Navigator.pop(context), child: const Text('취소')),
         FilledButton(
-          onPressed: seq.isEmpty
+          onPressed: !_canApply
               ? null
               : () {
-                  store.applyPattern(start, count, seq);
+                  store.applyPattern(
+                    start,
+                    count,
+                    seq,
+                    restSat: useRest && restSat,
+                    restSun: useRest && restSun,
+                    restHol: useRest && restHol,
+                  );
                   Navigator.pop(context);
                 },
           child: const Text('적용'),
