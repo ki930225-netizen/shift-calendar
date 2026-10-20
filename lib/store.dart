@@ -1,6 +1,7 @@
 import 'dart:convert';
 import 'dart:io' show File;
 import 'dart:typed_data';
+import 'dart:ui' show DartPluginRegistrant;
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter_local_notifications/flutter_local_notifications.dart';
@@ -25,8 +26,142 @@ class _Pending {
   final bool sound;
   final bool vibrate;
   final String key; // 같은 알람인지 구분하는 값 (알림 번호의 재료)
+  final int id; // 알림 번호 (같은 알람은 항상 같은 번호)
+  final bool notice; // 알람 전에 알림창에 띄우는 "N분 뒤 알람" 미리 알림
+  final int targetMs; // 미리 알림이 가리키는 실제 알람 시각(밀리초)
+  final String? payload;
   _Pending(this.when, this.title, this.body, this.alarmType,
-      {this.tone = 'bell', this.sound = true, this.vibrate = true, this.key = ''});
+      {this.tone = 'bell',
+      this.sound = true,
+      this.vibrate = true,
+      this.key = '',
+      this.id = 0,
+      this.notice = false,
+      this.targetMs = 0,
+      this.payload});
+}
+
+/// 알람 채널: 소리/진동 조합마다 채널이 따로 필요하다 (안드로이드 규칙)
+AndroidNotificationDetails buildAlarmDetails(String tone, bool sound, bool vibrate) {
+  final toneName = kTones[tone] ?? '벨';
+  AndroidNotificationSound? snd;
+  if (sound) {
+    snd = tone == 'sys'
+        ? const UriAndroidNotificationSound('content://settings/system/alarm_alert')
+        : RawResourceAndroidNotificationSound('alarm_$tone');
+  }
+  final chId = 'alarm2_${sound ? tone : 'mute'}_${vibrate ? 'v' : 'n'}';
+  final chName = '근무 알람 · ${sound ? toneName : '무음'}${vibrate ? ' · 진동' : ''}';
+  return AndroidNotificationDetails(
+    chId,
+    chName,
+    channelDescription: '근무 시간 알람',
+    importance: Importance.max,
+    priority: Priority.max,
+    category: AndroidNotificationCategory.alarm,
+    audioAttributesUsage: AudioAttributesUsage.alarm,
+    fullScreenIntent: true,
+    visibility: NotificationVisibility.public,
+    playSound: sound,
+    sound: snd,
+    enableVibration: vibrate,
+    vibrationPattern:
+        vibrate ? Int64List.fromList(<int>[0, 800, 500, 800, 500, 800, 500, 800]) : null,
+    additionalFlags: sound ? Int32List.fromList(<int>[4]) : null, // 4 = 끌 때까지 소리 반복
+    timeoutAfter: 180000, // 3분 뒤 자동으로 사라짐
+    actions: <AndroidNotificationAction>[
+      AndroidNotificationAction('snooze5', '5분 후 다시 울림',
+          showsUserInterface: false, cancelNotification: true),
+      AndroidNotificationAction('snooze10', '10분 후 다시 울림',
+          showsUserInterface: false, cancelNotification: true),
+      AndroidNotificationAction('stop', '알람 종료',
+          showsUserInterface: false, cancelNotification: true),
+    ],
+  );
+}
+
+
+/// 알람 알림에 붙여 두는 정보 (다시 울림 때 같은 소리·제목으로 다시 예약하기 위함)
+String alarmPayload(int id, String tone, bool sound, bool vibrate, String title, String body) =>
+    jsonEncode({'id': id, 't': tone, 's': sound, 'v': vibrate, 'ti': title, 'b': body});
+
+/// "N분 후 다시 울림": 지금부터 N분 뒤에 같은 알람을 다시 예약한다.
+/// 다시 울림 알림 번호는 0x40000000 이상으로 두어 평소 재등록 때 지워지지 않게 한다.
+@pragma('vm:entry-point')
+Future<void> snoozeFromPayload(String? payload, int minutes) async {
+  if (payload == null) return;
+  try {
+    DartPluginRegistrant.ensureInitialized();
+  } catch (_) {}
+  try {
+    final m = jsonDecode(payload);
+    if (m is! Map) return;
+    final id = (m['id'] as num?)?.toInt() ?? 0;
+    final sid = 0x40000000 + (id & 0xFFFFFF);
+    tzdata.initializeTimeZones();
+    tz.setLocalLocation(tz.getLocation('Asia/Seoul'));
+    final details = NotificationDetails(
+      android: buildAlarmDetails(
+        (m['t'] as String?) ?? 'bell',
+        (m['s'] as bool?) ?? true,
+        (m['v'] as bool?) ?? true,
+      ),
+    );
+    final when = tz.TZDateTime.now(tz.local).add(Duration(minutes: minutes));
+    final plugin = FlutterLocalNotificationsPlugin();
+    final title = (m['ti'] as String?) ?? '알람';
+    final body = '${(m['b'] as String?) ?? ''} (다시 울림)';
+    try {
+      await plugin.zonedSchedule(sid, title, body, when, details,
+          androidScheduleMode: AndroidScheduleMode.alarmClock, payload: payload);
+    } catch (_) {
+      await plugin.zonedSchedule(sid, title, body, when, details,
+          androidScheduleMode: AndroidScheduleMode.exactAllowWhileIdle, payload: payload);
+    }
+  } catch (e) {
+    debugPrint('다시 울림 실패: $e');
+  }
+}
+
+/// 알림 버튼(이번 알람 끄기 / 다시 울림) 처리
+void handleNotificationAction(NotificationResponse r) {
+  final a = r.actionId;
+  if (a == 'skip') {
+    skipFromPayload(r.payload);
+  } else if (a == 'snooze5') {
+    snoozeFromPayload(r.payload, 5);
+  } else if (a == 'snooze10') {
+    snoozeFromPayload(r.payload, 10);
+  }
+}
+
+/// "이번 알람 끄기" 처리: 그 회차 알람을 취소하고, 다시 등록되지 않도록 기억해 둔다.
+/// (앱이 꺼져 있어도 동작해야 해서 화면과 무관한 최상위 함수로 둔다)
+@pragma('vm:entry-point')
+Future<void> skipFromPayload(String? payload) async {
+  if (payload == null) return;
+  try {
+    DartPluginRegistrant.ensureInitialized();
+  } catch (_) {}
+  try {
+    final i = payload.lastIndexOf('#');
+    if (i < 0) return;
+    final key = payload.substring(0, i);
+    final id = int.tryParse(payload.substring(i + 1));
+    final p = await SharedPreferences.getInstance();
+    await p.reload();
+    final l = p.getStringList('skipped') ?? <String>[];
+    if (!l.contains(key)) l.add(key);
+    await p.setStringList('skipped', l);
+    if (id != null) await FlutterLocalNotificationsPlugin().cancel(id);
+  } catch (e) {
+    debugPrint('이번 알람 끄기 실패: $e');
+  }
+}
+
+@pragma('vm:entry-point')
+void notificationActionBackground(NotificationResponse r) {
+  handleNotificationAction(r);
 }
 
 class AlarmStatus {
@@ -81,6 +216,10 @@ class Store extends ChangeNotifier {
   bool weekRestSat = true;
   bool weekRestSun = true;
   bool weekRestHol = true;
+
+  int preNoticeMin = 20; // 알람 몇 분 전에 알림창에 미리 알려줄지 (0 = 끔)
+  String schedNote = ''; // 마지막 알람 등록 결과
+  int schedVersion = 0;
 
   // 폰 캘린더
   bool deviceCal = false;
@@ -215,6 +354,7 @@ class Store extends ChangeNotifier {
         'deviceCalSel': deviceCalSel,
         'holidaySync': holidaySync,
         'icalUrl': icalUrl,
+        'preNotice': preNoticeMin,
       };
 
   /// 저장된 상태를 통째로 읽어 반영. 하나라도 실패하면 아무것도 바꾸지 않고 false.
@@ -257,6 +397,7 @@ class Store extends ChangeNotifier {
       deviceCalSel = nSel;
       holidaySync = (m['holidaySync'] as bool?) ?? true;
       icalUrl = (m['icalUrl'] as String?) ?? '';
+      preNoticeMin = (m['preNotice'] as num?)?.toInt() ?? 20;
       return true;
     } catch (e) {
       loadNote = '$loadNote 데이터 해석 실패($e)';
@@ -771,6 +912,7 @@ class Store extends ChangeNotifier {
 
   // ── 알람 등록 ──
 
+  String lastSchedError = '';
   DateTime? _lastResched;
   bool _rescheduling = false;
   bool _reschedAgain = false;
@@ -813,21 +955,63 @@ class Store extends ChangeNotifier {
       await notif.cancelAll();
       await prefs.setBool('sched_v3', true);
     }
+    await prefs.reload(); // "이번 알람 끄기"가 다른 곳(백그라운드)에서 저장한 값을 읽기 위해
     final now = DateTime.now();
     final pend = <_Pending>[];
+    final used = <int>{};
+    int idFor(String key) {
+      var id = _fnv(key);
+      while (used.contains(id) || id == 9001 || id == 9002) {
+        id = (id + 1) & 0x3FFFFFFF;
+      }
+      used.add(id);
+      return id;
+    }
 
-    // 1) 근무별 알람: 앞으로 60일
+    // "이번 알람 끄기"로 건너뛰기로 한 회차 (지난 것은 정리)
+    final skipped = <String>{...(prefs.getStringList('skipped') ?? <String>[])};
+    skipped.removeWhere((k) {
+      final parts = k.split('|');
+      final ms = parts.length >= 3 ? int.tryParse(parts[2]) : null;
+      return ms == null || ms < now.millisecondsSinceEpoch - 86400000;
+    });
+    await prefs.setStringList('skipped', skipped.toList());
+
+    // 1) 근무별 알람: 앞으로 60일 (+ 알람 전 미리 알림)
     for (final na in planShiftAlarms(now, 60)) {
       final a = na.alarm;
       final shift = shiftById(a.shiftId);
       if (shift == null) continue;
+      final key = 'S|${a.id}|${na.when.millisecondsSinceEpoch}';
+      if (skipped.contains(key)) continue;
       final String day = a.dayOffset < 0 ? '내일' : (a.dayOffset > 0 ? '어제' : '오늘');
       final body = a.label.isNotEmpty ? a.label : '$day ${shift.label} 근무 · ${fmtHM(a.minutes)}';
-      pend.add(_Pending(na.when, '${shift.label} 근무 알람', body, true,
+      final aid = idFor(key);
+      final atitle = '${shift.label} 근무 알람';
+      pend.add(_Pending(na.when, atitle, body, true,
           tone: a.tone,
           sound: a.sound,
           vibrate: a.vibrate,
-          key: 'S|${a.id}|${na.when.millisecondsSinceEpoch}'));
+          key: key,
+          id: aid,
+          payload: alarmPayload(aid, a.tone, a.sound, a.vibrate, atitle, body)));
+      if (preNoticeMin > 0) {
+        final nw = na.when.subtract(Duration(minutes: preNoticeMin));
+        if (nw.isAfter(now)) {
+          final nkey = 'P|$key';
+          pend.add(_Pending(
+            nw,
+            '$preNoticeMin분 뒤 알람 · ${shift.label} 근무',
+            '${fmtHM(a.minutes)}에 알람이 울려요. 이번만 끄려면 아래 버튼을 누르세요',
+            false,
+            key: nkey,
+            id: idFor(nkey),
+            notice: true,
+            targetMs: na.when.millisecondsSinceEpoch,
+            payload: '$key#$aid',
+          ));
+        }
+      }
     }
 
     // 2) 메모 알림: 앞으로 120일
@@ -839,73 +1023,73 @@ class Store extends ChangeNotifier {
       final when = DateTime(sd.year, sd.month, sd.day, base ~/ 60, base % 60)
           .subtract(Duration(minutes: m.alarmBefore));
       if (when.isBefore(now) || when.isAfter(limit)) continue;
+      final key = 'M|${m.id}|${when.millisecondsSinceEpoch}';
       pend.add(_Pending(when, '메모 알림', m.title.isEmpty ? '(제목 없음)' : m.title, false,
-          key: 'M|${m.id}|${when.millisecondsSinceEpoch}'));
+          key: key, id: idFor(key)));
     }
 
     // 안드로이드 예약 한도(약 500개)를 넘지 않도록 가까운 순서로 450개까지
     pend.sort((a, b) => a.when.compareTo(b.when));
     final take = pend.take(450).toList();
+    final keep = <int>{for (final p in take) p.id};
 
     // 같은 알람은 항상 같은 번호로 등록 → 다시 등록해도 덮어쓸 뿐이라 중간에 앱이 멈춰도 알람이 사라지지 않는다
-    final ids = <int>[];
-    final used = <int>{};
+    int nClock = 0, nExact = 0, nInexact = 0, nFail = 0, nAlarm = 0;
     for (final p in take) {
-      var id = _fnv(p.key);
-      while (used.contains(id) || id == 9001 || id == 9002) {
-        id = (id + 1) & 0x3FFFFFFF;
-      }
-      used.add(id);
-      ids.add(id);
-    }
-    for (int i = 0; i < take.length; i++) {
-      await _scheduleOne(ids[i], take[i]);
+      final r = await _scheduleOne(p.id, p);
+      if (r == 'clock') nClock++;
+      if (r == 'exact') nExact++;
+      if (r == 'inexact') nInexact++;
+      if (r == 'fail') nFail++;
+      if (p.alarmType) nAlarm++;
     }
 
     // 더 이상 필요 없는(지워졌거나 바뀐) 알림만 취소
     try {
       final pending = await notif.pendingNotificationRequests();
       for (final r in pending) {
-        if (r.id == 9001 || r.id == 9002) continue;
-        if (!used.contains(r.id)) await notif.cancel(r.id);
+        if (r.id == 9001 || r.id == 9002 || r.id >= 0x40000000) continue;
+        if (!keep.contains(r.id)) await notif.cancel(r.id);
       }
     } catch (_) {}
+
+    schedNote = '근무 알람 $nAlarm개 포함 총 ${take.length}개 등록 '
+        '(알람시계 $nClock · 정확 $nExact · 부정확 $nInexact · 실패 $nFail) '
+        '${DateFormat('HH:mm:ss').format(DateTime.now())}';
+    schedVersion++;
+    notifyListeners();
   }
 
-  /// 알람 채널: 소리/진동 조합마다 채널이 따로 필요하다 (안드로이드 규칙)
-  AndroidNotificationDetails _alarmDetails(String tone, bool sound, bool vibrate) {
-    final toneName = kTones[tone] ?? '벨';
-    AndroidNotificationSound? snd;
-    if (sound) {
-      snd = tone == 'sys'
-          ? const UriAndroidNotificationSound('content://settings/system/alarm_alert')
-          : RawResourceAndroidNotificationSound('alarm_$tone');
-    }
-    final chId = 'alarm2_${sound ? tone : 'mute'}_${vibrate ? 'v' : 'n'}';
-    final chName = '근무 알람 · ${sound ? toneName : '무음'}${vibrate ? ' · 진동' : ''}';
-    return AndroidNotificationDetails(
-      chId,
-      chName,
-      channelDescription: '근무 시간 알람',
-      importance: Importance.max,
-      priority: Priority.max,
-      category: AndroidNotificationCategory.alarm,
-      audioAttributesUsage: AudioAttributesUsage.alarm,
-      fullScreenIntent: true,
-      visibility: NotificationVisibility.public,
-      playSound: sound,
-      sound: snd,
-      enableVibration: vibrate,
-      vibrationPattern:
-          vibrate ? Int64List.fromList(<int>[0, 800, 500, 800, 500, 800, 500, 800]) : null,
-      additionalFlags: sound ? Int32List.fromList(<int>[4]) : null, // 4 = 끌 때까지 소리 반복
-      timeoutAfter: 180000, // 3분 뒤 자동으로 사라짐
-    );
-  }
+  AndroidNotificationDetails _alarmDetails(String tone, bool sound, bool vibrate) =>
+      buildAlarmDetails(tone, sound, vibrate);
 
   NotificationDetails _detailsFor(_Pending p) {
     if (p.alarmType) {
       return NotificationDetails(android: _alarmDetails(p.tone, p.sound, p.vibrate));
+    }
+    if (p.notice) {
+      final lead = p.targetMs - p.when.millisecondsSinceEpoch;
+      return NotificationDetails(
+        android: AndroidNotificationDetails(
+          'alarm_notice',
+          '알람 미리 알림',
+          channelDescription: '알람이 울리기 전에 알림창에 몇 분 남았는지 표시',
+          importance: Importance.low,
+          priority: Priority.low,
+          playSound: false,
+          enableVibration: false,
+          category: AndroidNotificationCategory.reminder,
+          showWhen: true,
+          when: p.targetMs,
+          usesChronometer: true,
+          chronometerCountDown: true,
+          timeoutAfter: lead > 0 ? lead : null,
+          actions: <AndroidNotificationAction>[
+            const AndroidNotificationAction('skip', '이번 알람 끄기',
+                showsUserInterface: false, cancelNotification: true),
+          ],
+        ),
+      );
     }
     return const NotificationDetails(
       android: AndroidNotificationDetails(
@@ -935,10 +1119,13 @@ class Store extends ChangeNotifier {
           ];
     for (final mode in modes) {
       try {
-        await notif.zonedSchedule(id, p.title, p.body, when, details, androidScheduleMode: mode);
+        await notif.zonedSchedule(id, p.title, p.body, when, details,
+            androidScheduleMode: mode, payload: p.payload);
+        if (mode == AndroidScheduleMode.alarmClock) return 'clock';
         return mode == AndroidScheduleMode.inexactAllowWhileIdle ? 'inexact' : 'exact';
       } catch (e) {
         debugPrint('알람 예약 실패($mode): $e');
+        lastSchedError = '$mode: $e';
       }
     }
     return 'fail';
@@ -947,6 +1134,7 @@ class Store extends ChangeNotifier {
   /// 알람 테스트. now=true 면 바로 울리고, 아니면 10초 뒤에 울린다.
   Future<String> testAlarm({
     required bool now,
+    int seconds = 10,
     String tone = 'bell',
     bool sound = true,
     bool vibrate = true,
@@ -954,22 +1142,26 @@ class Store extends ChangeNotifier {
     if (kIsWeb) return 'PC 미리보기에서는 알람을 테스트할 수 없어요';
     try {
       final p = _Pending(
-        DateTime.now().add(const Duration(seconds: 10)),
+        DateTime.now().add(Duration(seconds: seconds)),
         '테스트 알람',
         '이 알람이 들리면 정상입니다',
         true,
         tone: tone,
         sound: sound,
         vibrate: vibrate,
+        payload: alarmPayload(9002, tone, sound, vibrate, '테스트 알람', '이 알람이 들리면 정상입니다'),
       );
       if (now) {
-        await notif.show(9001, p.title, p.body, _detailsFor(p));
+        await notif.show(9001, p.title, p.body, _detailsFor(p), payload: p.payload);
         return '알림을 보냈어요. 소리가 안 나면 아래 점검 항목을 확인하세요';
       }
       final r = await _scheduleOne(9002, p);
-      if (r == 'exact') return '10초 뒤에 울려요. 화면을 꺼 두고 기다려 보세요';
+      final String when = seconds >= 60 ? '${seconds ~/ 60}분' : '$seconds초';
+      if (r == 'clock' || r == 'exact') {
+        return '$when 뒤에 울려요. 앱을 완전히 종료하고 화면을 끈 채로 기다려 보세요';
+      }
       if (r == 'inexact') return '예약은 됐지만 "정확한 알람" 권한이 없어 시간이 늦을 수 있어요';
-      return '알람 예약에 실패했어요. 알림 권한을 확인하세요';
+      return '알람 예약에 실패했어요: $lastSchedError';
     } catch (e) {
       return '테스트 실패: $e';
     }
@@ -1012,6 +1204,8 @@ Future<void> initNotifications() async {
     const InitializationSettings(
       android: AndroidInitializationSettings('@mipmap/ic_launcher'),
     ),
+    onDidReceiveNotificationResponse: handleNotificationAction,
+    onDidReceiveBackgroundNotificationResponse: notificationActionBackground,
   );
   final a =
       notif.resolvePlatformSpecificImplementation<AndroidFlutterLocalNotificationsPlugin>();

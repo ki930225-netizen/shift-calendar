@@ -99,14 +99,19 @@ class AlarmPage extends StatefulWidget {
 
 class _AlarmPageState extends State<AlarmPage> {
   Timer? _timer;
-  late Future<AlarmStatus> _status = store.alarmStatus();
+  AlarmStatus? _st;
+  int _seenVer = -1;
   String _msg = '';
 
   @override
   void initState() {
     super.initState();
     store.addListener(_r);
-    _timer = Timer.periodic(const Duration(seconds: 30), (_) => _r());
+    _loadStatus();
+    _timer = Timer.periodic(const Duration(seconds: 30), (_) {
+      _loadStatus();
+      _r();
+    });
   }
 
   @override
@@ -117,11 +122,20 @@ class _AlarmPageState extends State<AlarmPage> {
   }
 
   void _r() {
+    if (store.schedVersion != _seenVer) {
+      _seenVer = store.schedVersion;
+      _loadStatus(); // 알람 등록이 끝날 때마다 상태를 새로 읽는다
+    }
     if (mounted) setState(() {});
   }
 
+  Future<void> _loadStatus() async {
+    final s = await store.alarmStatus();
+    if (mounted) setState(() => _st = s);
+  }
+
   void _refreshStatus() {
-    setState(() => _status = store.alarmStatus());
+    _loadStatus();
   }
 
   String _remain(DateTime when) {
@@ -141,8 +155,8 @@ class _AlarmPageState extends State<AlarmPage> {
     ));
   }
 
-  Future<void> _test(bool now) async {
-    final m = await store.testAlarm(now: now);
+  Future<void> _test(bool now, int seconds) async {
+    final m = await store.testAlarm(now: now, seconds: seconds);
     if (!mounted) return;
     setState(() => _msg = m);
     _refreshStatus();
@@ -175,10 +189,9 @@ class _AlarmPageState extends State<AlarmPage> {
       color: const Color(0xFFF4F6FA),
       child: Padding(
         padding: const EdgeInsets.fromLTRB(14, 12, 14, 8),
-        child: FutureBuilder<AlarmStatus>(
-          future: _status,
-          builder: (ctx, snap) {
-            final s = snap.data;
+        child: Builder(
+          builder: (ctx) {
+            final s = _st;
             return Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
               Row(children: [
                 const Text('알람 상태 점검', style: TextStyle(fontWeight: FontWeight.bold)),
@@ -210,26 +223,52 @@ class _AlarmPageState extends State<AlarmPage> {
                     Text('예약된 알림 ${s.pending}개'),
                   ]),
                 ),
+                if (store.schedNote.isNotEmpty)
+                  Text('마지막 등록: ${store.schedNote}',
+                      style: const TextStyle(fontSize: 11, color: Colors.grey)),
+                if (store.lastSchedError.isNotEmpty)
+                  Text('등록 오류: ${store.lastSchedError}',
+                      style: const TextStyle(fontSize: 11, color: Colors.red)),
               ],
+              const SizedBox(height: 8),
+              Row(children: [
+                const Text('알람 전 미리 알림', style: TextStyle(fontWeight: FontWeight.w600)),
+                const Spacer(),
+                DropdownButton<int>(
+                  value: const [0, 10, 20, 30, 60].contains(store.preNoticeMin)
+                      ? store.preNoticeMin
+                      : 20,
+                  items: const [0, 10, 20, 30, 60]
+                      .map((e) => DropdownMenuItem<int>(
+                          value: e, child: Text(e == 0 ? '끄기' : '$e분 전')))
+                      .toList(),
+                  onChanged: (v) {
+                    store.preNoticeMin = v ?? 20;
+                    store.save();
+                  },
+                ),
+              ]),
+              const Text('알람 전에 알림창에 "N분 뒤 알람"이 뜨고, 거기서 "이번 알람 끄기"를 누르면 그 회차만 꺼져요',
+                  style: TextStyle(fontSize: 11, color: Colors.grey)),
               const SizedBox(height: 8),
               const Text('알람 볼륨', style: TextStyle(fontWeight: FontWeight.w600)),
               const AlarmVolumeSlider(),
               const SizedBox(height: 4),
-              Row(children: [
-                Expanded(
-                  child: OutlinedButton.icon(
-                    onPressed: () => _test(true),
-                    icon: const Icon(Icons.volume_up, size: 18),
-                    label: const Text('지금 소리 테스트'),
-                  ),
+              Wrap(spacing: 8, runSpacing: 4, children: [
+                OutlinedButton.icon(
+                  onPressed: () => _test(true, 0),
+                  icon: const Icon(Icons.volume_up, size: 18),
+                  label: const Text('지금 소리'),
                 ),
-                const SizedBox(width: 8),
-                Expanded(
-                  child: OutlinedButton.icon(
-                    onPressed: () => _test(false),
-                    icon: const Icon(Icons.timer, size: 18),
-                    label: const Text('10초 뒤 테스트'),
-                  ),
+                OutlinedButton.icon(
+                  onPressed: () => _test(false, 10),
+                  icon: const Icon(Icons.timer, size: 18),
+                  label: const Text('10초 뒤'),
+                ),
+                OutlinedButton.icon(
+                  onPressed: () => _test(false, 120),
+                  icon: const Icon(Icons.timer_outlined, size: 18),
+                  label: const Text('2분 뒤 (앱 종료 테스트)'),
                 ),
               ]),
               if (_msg.isNotEmpty)
