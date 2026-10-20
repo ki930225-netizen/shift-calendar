@@ -98,3 +98,15 @@ Future<List<Map<String, dynamic>>> deviceEvents(int startMs, int endMs, List<int
     return <Map<String, dynamic>>[];
   }
 }
+
+// ───────────── 저장 폴더 ─────────────
+
+/// 앱 전용 파일 폴더 경로 (데이터 파일 저장용)
+Future<String?> filesDirPath() async {
+  if (kIsWeb) return null;
+  try {
+    return await _ch.invokeMethod<String>('getFilesDir');
+  } catch (_) {
+    return null;
+  }
+}

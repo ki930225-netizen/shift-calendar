@@ -383,6 +383,7 @@ class MainActivity : FlutterActivity() {
                             startActivity(i)
                             result.success(true)
                         }
+                        "getFilesDir" -> result.success(filesDir.absolutePath)
                         "hasCalendarPermission" -> result.success(hasCal())
                         "requestCalendarPermission" -> {
                             if (hasCal()) {

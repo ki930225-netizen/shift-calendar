@@ -1,4 +1,5 @@
 import 'dart:convert';
+import 'dart:io' show File;
 import 'dart:typed_data';
 
 import 'package:flutter/foundation.dart';
@@ -174,8 +175,109 @@ class Store extends ChangeNotifier {
 
   // ── 불러오기 / 저장 ──
 
-  Future<void> load() async {
-    final p = await SharedPreferences.getInstance();
+  // 저장 상태 (설정 화면의 "저장 상태 점검"에 표시)
+  String loadSource = '';
+  String loadNote = '';
+  String saveNote = '';
+  DateTime? lastSaveAt;
+  String? _dir;
+
+  /// 앱 전용 폴더 안의 파일 (설정저장소와 별개로 한 벌 더 저장해 두는 용도)
+  Future<File?> _file(String name) async {
+    if (kIsWeb) return null;
+    try {
+      _dir ??= await filesDirPath();
+      final d = _dir;
+      if (d == null || d.isEmpty) return null;
+      return File('$d/$name');
+    } catch (_) {
+      return null;
+    }
+  }
+
+  Map<String, dynamic> _state() => {
+        'v': 3,
+        'savedAt': DateTime.now().millisecondsSinceEpoch,
+        'days': days,
+        'attend': attend,
+        'attendTypes': attendTypes,
+        'pattern': pattern,
+        'memos': memos.map((e) => e.toJson()).toList(),
+        'alarms': alarms.map((e) => e.toJson()).toList(),
+        'nextId': nextId,
+        'monthMemos': monthMemos,
+        'week': weekPattern.map((k, v) => MapEntry(k.toString(), v)),
+        'weekBefore': weekBefore,
+        'weekSat': weekRestSat,
+        'weekSun': weekRestSun,
+        'weekHol': weekRestHol,
+        'deviceCal': deviceCal,
+        'deviceCalSel': deviceCalSel,
+        'holidaySync': holidaySync,
+        'icalUrl': icalUrl,
+      };
+
+  /// 저장된 상태를 통째로 읽어 반영. 하나라도 실패하면 아무것도 바꾸지 않고 false.
+  bool _applyState(Map<String, dynamic> m) {
+    try {
+      final nDays = Map<String, String>.from((m['days'] as Map?) ?? {});
+      final nAttend = Map<String, String>.from((m['attend'] as Map?) ?? {});
+      final nTypes = List<String>.from((m['attendTypes'] as List?) ?? attendTypes);
+      final nPattern = List<String>.from((m['pattern'] as List?) ?? []);
+      final nMemos = ((m['memos'] as List?) ?? [])
+          .map((e) => Memo.fromJson(Map<String, dynamic>.from(e as Map)))
+          .toList();
+      final nAlarms = ((m['alarms'] as List?) ?? [])
+          .map((e) => AlarmItem.fromJson(Map<String, dynamic>.from(e as Map)))
+          .toList();
+      final nMonth = Map<String, String>.from((m['monthMemos'] as Map?) ?? {});
+      final nWeek = <int, String>{};
+      Map<String, dynamic>.from((m['week'] as Map?) ?? {}).forEach((k, v) {
+        final n = int.tryParse(k);
+        if (n != null) nWeek[n] = '$v';
+      });
+      final nSel = <int>[];
+      for (final e in ((m['deviceCalSel'] as List?) ?? [])) {
+        if (e is num) nSel.add(e.toInt());
+      }
+      days = nDays;
+      attend = nAttend;
+      attendTypes = nTypes;
+      pattern = nPattern;
+      memos = nMemos;
+      alarms = nAlarms;
+      nextId = (m['nextId'] as num?)?.toInt() ?? 1;
+      monthMemos = nMonth;
+      weekPattern = nWeek;
+      weekBefore = m['weekBefore'] as String?;
+      weekRestSat = (m['weekSat'] as bool?) ?? true;
+      weekRestSun = (m['weekSun'] as bool?) ?? true;
+      weekRestHol = (m['weekHol'] as bool?) ?? true;
+      deviceCal = (m['deviceCal'] as bool?) ?? false;
+      deviceCalSel = nSel;
+      holidaySync = (m['holidaySync'] as bool?) ?? true;
+      icalUrl = (m['icalUrl'] as String?) ?? '';
+      return true;
+    } catch (e) {
+      loadNote = '$loadNote 데이터 해석 실패($e)';
+      return false;
+    }
+  }
+
+  Map<String, dynamic>? _parseJson(String? s) {
+    if (s == null || s.isEmpty) return null;
+    try {
+      final v = jsonDecode(s);
+      return v is Map ? Map<String, dynamic>.from(v) : null;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  int _savedAt(Map<String, dynamic> m) => (m['savedAt'] as num?)?.toInt() ?? 0;
+
+  /// 예전 버전(v2.0~2.2)이 여러 칸으로 나눠 저장해 둔 데이터를 읽는다 (처음 한 번 옮겨 담기용)
+  bool _loadLegacy(SharedPreferences p) {
     days = _decodeStrMap(p.getString('v2_days'));
     attend = _decodeStrMap(p.getString('v2_attend'));
     attendTypes = p.getStringList('v2_attendTypes') ?? attendTypes;
@@ -198,44 +300,135 @@ class Store extends ChangeNotifier {
     deviceCalSel =
         (p.getStringList('deviceCalSel') ?? <String>[]).map((e) => int.tryParse(e) ?? -1).toList();
     deviceCalSel.removeWhere((e) => e < 0);
-
     holidaySync = p.getBool('holidaySync') ?? true;
     icalUrl = p.getString('icalUrl') ?? '';
-    lastSync = p.getString('lastSync') ?? '';
-    holidayEvs = _decodeList<Ev>(p.getString('ev_holiday'), Ev.fromJson);
-    googleEvs = _decodeList<Ev>(p.getString('ev_google'), Ev.fromJson);
+    return days.isNotEmpty || alarms.isNotEmpty || memos.isNotEmpty;
+  }
+
+  /// 설정저장소와 파일, 두 곳에서 읽어 더 최근에 저장된 쪽을 쓴다
+  Future<void> load() async {
+    SharedPreferences? p;
+    try {
+      p = await SharedPreferences.getInstance();
+    } catch (e) {
+      loadNote = '설정저장소 열기 실패($e)';
+    }
+    final cands = <MapEntry<String, Map<String, dynamic>>>[];
+    if (p != null) {
+      final m = _parseJson(p.getString('v3_state'));
+      if (m != null) cands.add(MapEntry('설정저장소', m));
+    }
+    try {
+      final f = await _file('shift_data.json');
+      if (f != null && await f.exists()) {
+        final m = _parseJson(await f.readAsString());
+        if (m != null) cands.add(MapEntry('파일', m));
+      }
+    } catch (e) {
+      loadNote = '$loadNote 파일 읽기 실패($e)';
+    }
+    cands.sort((a, b) => _savedAt(b.value).compareTo(_savedAt(a.value)));
+    bool done = false;
+    for (final c in cands) {
+      if (_applyState(c.value)) {
+        loadSource = c.key;
+        done = true;
+        break;
+      }
+    }
+    if (!done && p != null) {
+      final had = _loadLegacy(p);
+      loadSource = had ? '이전 버전 저장소(옮겨 담음)' : '저장된 데이터 없음(처음 실행)';
+    }
+    if (p != null) {
+      lastSync = p.getString('lastSync') ?? '';
+      holidayEvs = _decodeList<Ev>(p.getString('ev_holiday'), Ev.fromJson);
+      googleEvs = _decodeList<Ev>(p.getString('ev_google'), Ev.fromJson);
+    }
     _rebuildEv();
-    _loaded = true;
+    // 둘 다 열 수 없으면 저장도 못 하므로 기존 데이터를 건드리지 않게 막아 둔다
+    _loaded = p != null || (await _file('shift_data.json')) != null;
     notifyListeners();
+  }
+
+  bool _saving = false;
+  bool _saveAgain = false;
+
+  /// 저장은 한 번에 하나씩 (연달아 눌러도 파일이 꼬이지 않게)
+  Future<void> _persist() async {
+    if (_saving) {
+      _saveAgain = true;
+      return;
+    }
+    _saving = true;
+    try {
+      do {
+        _saveAgain = false;
+        await _persistOnce();
+      } while (_saveAgain);
+    } finally {
+      _saving = false;
+    }
+  }
+
+  Future<void> _persistOnce() async {
+    final js = jsonEncode(_state());
+    bool a = false;
+    bool b = false;
+    final err = StringBuffer();
+    try {
+      final p = await SharedPreferences.getInstance();
+      a = await p.setString('v3_state', js);
+    } catch (e) {
+      err.write('설정저장소 $e ');
+    }
+    try {
+      final f = await _file('shift_data.json');
+      if (f != null) {
+        final tmp = File('${f.path}.tmp');
+        await tmp.writeAsString(js, flush: true);
+        await tmp.rename(f.path);
+        b = true;
+      }
+    } catch (e) {
+      err.write('파일 $e');
+    }
+    lastSaveAt = DateTime.now();
+    saveNote = '설정저장소 ${a ? '성공' : '실패'} · 파일 ${b ? '성공' : '실패'}'
+        '${err.isEmpty ? '' : ' ($err)'}';
   }
 
   Future<void> save({bool resched = true}) async {
     notifyListeners();
     if (!_loaded) return; // 불러오기에 실패한 상태면 기존 저장 데이터를 건드리지 않는다
-    final p = await SharedPreferences.getInstance();
-    await p.setString('v2_days', jsonEncode(days));
-    await p.setString('v2_attend', jsonEncode(attend));
-    await p.setStringList('v2_attendTypes', attendTypes);
-    await p.setStringList('v2_pattern', pattern);
-    await p.setString('v2_memos', jsonEncode(memos.map((e) => e.toJson()).toList()));
-    await p.setString('v2_alarms', jsonEncode(alarms.map((e) => e.toJson()).toList()));
-    await p.setInt('v2_nextId', nextId);
-    await p.setString('v2_monthMemos', jsonEncode(monthMemos));
-    await p.setString(
-        'v2_week', jsonEncode(weekPattern.map((k, v) => MapEntry(k.toString(), v))));
-    if (weekBefore == null) {
-      await p.remove('v2_weekBefore');
-    } else {
-      await p.setString('v2_weekBefore', weekBefore!);
-    }
-    await p.setBool('v2_weekSat', weekRestSat);
-    await p.setBool('v2_weekSun', weekRestSun);
-    await p.setBool('v2_weekHol', weekRestHol);
-    await p.setBool('deviceCal', deviceCal);
-    await p.setStringList('deviceCalSel', deviceCalSel.map((e) => '$e').toList());
-    await p.setBool('holidaySync', holidaySync);
-    await p.setString('icalUrl', icalUrl);
+    await _persist();
     if (resched) await rescheduleAll();
+  }
+
+  /// 저장소가 실제로 쓰고 읽히는지 점검 (설정 화면의 "저장 테스트")
+  Future<String> storageSelfTest() async {
+    final out = <String>[];
+    final t = DateTime.now().millisecondsSinceEpoch.toString();
+    try {
+      final p = await SharedPreferences.getInstance();
+      await p.setString('selftest', t);
+      await p.reload();
+      out.add('설정저장소: ${p.getString('selftest') == t ? '정상' : '쓴 값을 못 읽음'}');
+    } catch (e) {
+      out.add('설정저장소 오류: $e');
+    }
+    try {
+      final f = await _file('selftest.txt');
+      if (f == null) {
+        out.add('파일: 폴더를 찾지 못함');
+      } else {
+        await f.writeAsString(t, flush: true);
+        out.add('파일: ${(await f.readAsString()) == t ? '정상' : '쓴 값을 못 읽음'}');
+      }
+    } catch (e) {
+      out.add('파일 오류: $e');
+    }
+    return out.join('\n');
   }
 
   // ── 근무 / 근태 ──

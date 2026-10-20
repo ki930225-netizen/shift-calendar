@@ -18,6 +18,7 @@ class SettingsPage extends StatefulWidget {
 
 class _SettingsPageState extends State<SettingsPage> {
   late final TextEditingController _url = TextEditingController(text: store.icalUrl);
+  String _testMsg = '';
 
   @override
   void initState() {
@@ -275,6 +276,40 @@ class _SettingsPageState extends State<SettingsPage> {
               onPressed: _restore,
             ),
           ]),
+          const Divider(height: 32),
+          Text('저장 상태 점검', style: Theme.of(context).textTheme.titleMedium),
+          const SizedBox(height: 4),
+          Text(
+            '불러온 곳: ${store.loadSource.isEmpty ? '-' : store.loadSource}\n'
+            '현재 데이터: 근무 ${store.days.length}일 · 알람 ${store.alarms.length}개 · 메모 ${store.memos.length}개\n'
+            '마지막 저장: ${store.lastSaveAt == null ? '아직 없음' : DateFormat('HH:mm:ss').format(store.lastSaveAt!)}'
+            '${store.saveNote.isEmpty ? '' : '\n${store.saveNote}'}'
+            '${store.loadNote.isEmpty ? '' : '\n불러오기 메모: ${store.loadNote}'}',
+            style: const TextStyle(fontSize: 12, color: Colors.grey, height: 1.5),
+          ),
+          const SizedBox(height: 8),
+          Row(children: [
+            OutlinedButton(
+              onPressed: () async {
+                final m = await store.storageSelfTest();
+                if (mounted) setState(() => _testMsg = m);
+              },
+              child: const Text('저장 테스트'),
+            ),
+            const SizedBox(width: 8),
+            OutlinedButton(
+              onPressed: () async {
+                await store.save(resched: false);
+                if (mounted) setState(() {});
+              },
+              child: const Text('지금 저장'),
+            ),
+          ]),
+          if (_testMsg.isNotEmpty)
+            Padding(
+              padding: const EdgeInsets.only(top: 8),
+              child: Text(_testMsg, style: const TextStyle(fontSize: 12)),
+            ),
           const SizedBox(height: 32),
         ],
       ),
